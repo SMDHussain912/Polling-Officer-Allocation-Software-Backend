@@ -5,14 +5,17 @@
  *
  *   POST /api/imports/personnel   upload one proforma workbook (base64 JSON)
  *   GET  /api/imports/batches     recent import batches (traceability)
+ *   GET  /api/imports/batches/:id/personnel
+ *          personnel accepted in one batch (sensitive fields excluded)
  *
  * Upload format: { "fileName": "...", "dataBase64": "<file as base64>" }.
  * (JSON instead of multipart so no extra upload package is needed; the file
  * content never touches disk.)
  *
  * Authorization: session required. Role gating awaits the permission-matrix
- * decision (DECISIONS_AND_OPEN_QUESTIONS B6); Aadhar is never returned by
- * these endpoints (personnel rows are not returned at all).
+ * decision (DECISIONS_AND_OPEN_QUESTIONS B6). The personnel read endpoint
+ * uses an explicit column allow-list and never returns Aadhaar, voter ID or
+ * mobile number (see the handler below); do not change it to SELECT *.
  */
 
 const express = require('express');
@@ -79,6 +82,60 @@ router.get('/batches', async (req, res) => {
       LIMIT 50`
   );
   res.json({ ok: true, batches: rows });
+});
+
+// Personnel accepted in a single import batch (review-before-use).
+// Explicit column allow-list: Aadhaar, voter ID and mobile number are NOT
+// selected, so they cannot leak through the response, errors or debug output.
+// 404 on an unknown batch; invalid ids -> 400.
+router.get('/batches/:id/personnel', async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    return res.status(400).json({ ok: false, error: 'Invalid batch id' });
+  }
+
+  try {
+    const batchResult = await pool.query(
+      `SELECT id, file_name, department_name, total_rows, accepted_rows, status, imported_at
+         FROM import_batches
+        WHERE id = $1`,
+      [id]
+    );
+    if (batchResult.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Import batch not found' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, employee_id, employee_name, designation, gender, gazetted_status,
+              work_mandal, native_mandal, working_constituency_name, import_status
+         FROM personnel
+        WHERE import_batch_id = $1
+        ORDER BY id
+        LIMIT 1000`,
+      [id]
+    );
+
+    // Defense-in-depth: the SQL above already selects only safe columns, but
+    // we re-project explicitly so Aadhaar / voter ID / mobile can never reach
+    // the response even if the query or schema changes later.
+    const personnel = result.rows.map((r) => ({
+      id: r.id,
+      employeeId: r.employee_id,
+      employeeName: r.employee_name,
+      designation: r.designation,
+      gender: r.gender,
+      gazettedStatus: r.gazetted_status,
+      workMandal: r.work_mandal,
+      nativeMandal: r.native_mandal,
+      workingConstituencyName: r.working_constituency_name,
+      importStatus: r.import_status,
+    }));
+
+    res.json({ ok: true, batch: batchResult.rows[0], count: personnel.length, personnel });
+  } catch (err) {
+    console.error('list batch personnel failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load personnel' });
+  }
 });
 
 module.exports = router;
