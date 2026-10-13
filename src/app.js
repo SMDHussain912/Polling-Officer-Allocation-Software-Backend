@@ -2,6 +2,7 @@ const express = require('express');
 const session = require('express-session');
 const config = require('./config');
 const authRoutes = require('./modules/auth');
+const importRoutes = require('./modules/imports');
 
 const app = express();
 
@@ -16,5 +17,6 @@ app.use(
 );
 
 app.use('/api/auth', authRoutes);
+app.use('/api/imports', importRoutes);
 
 module.exports = app;
