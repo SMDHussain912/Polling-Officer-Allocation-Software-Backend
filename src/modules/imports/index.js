@@ -12,15 +12,20 @@
  * (JSON instead of multipart so no extra upload package is needed; the file
  * content never touches disk.)
  *
- * Authorization: session required. Role gating awaits the permission-matrix
- * decision (DECISIONS_AND_OPEN_QUESTIONS B6). The personnel read endpoint
- * uses an explicit column allow-list and never returns Aadhaar, voter ID or
- * mobile number (see the handler below); do not change it to SELECT *.
+ * Authorization: session required (router.use(requireAuth)). Role policy is
+ * enforced per route with authorize(...roles):
+ *   POST /personnel                 -> authority, admin
+ *   GET  /batches                   -> staff, authority, admin (read-only)
+ *   GET  /batches/:id/personnel     -> staff, authority, admin (read-only)
+ *
+ * The personnel read endpoints use an explicit column allow-list and never
+ * return Aadhaar, voter ID or mobile number (see the handler below); do not
+ * change them to SELECT *.
  */
 
 const express = require('express');
 const pool = require('../../database');
-const { requireAuth } = require('../../middleware/auth');
+const { requireAuth, authorize } = require('../../middleware/auth');
 const { persistPersonnelImport } = require('./import.service');
 const { ImportParseError } = require('./excel.parser');
 
@@ -30,7 +35,7 @@ const router = express.Router();
 router.use(requireAuth);
 router.use(express.json({ limit: '20mb' }));
 
-router.post('/personnel', async (req, res) => {
+router.post('/personnel', authorize('authority', 'admin'), async (req, res) => {
   const { fileName, dataBase64 } = req.body || {};
   if (!fileName || typeof fileName !== 'string') {
     return res.status(400).json({ ok: false, error: 'fileName is required' });
@@ -72,7 +77,7 @@ router.post('/personnel', async (req, res) => {
   }
 });
 
-router.get('/batches', async (req, res) => {
+router.get('/batches', authorize('staff', 'authority', 'admin'), async (req, res) => {
   const { rows } = await pool.query(
     `SELECT b.id, b.file_name, b.department_name, b.total_rows, b.accepted_rows,
             b.rejected_rows, b.status, b.imported_at, u.username AS imported_by
@@ -88,7 +93,7 @@ router.get('/batches', async (req, res) => {
 // Explicit column allow-list: Aadhaar, voter ID and mobile number are NOT
 // selected, so they cannot leak through the response, errors or debug output.
 // 404 on an unknown batch; invalid ids -> 400.
-router.get('/batches/:id/personnel', async (req, res) => {
+router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), async (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isSafeInteger(id) || id <= 0) {
     return res.status(400).json({ ok: false, error: 'Invalid batch id' });
