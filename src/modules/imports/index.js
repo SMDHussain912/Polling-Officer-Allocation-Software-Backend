@@ -425,4 +425,141 @@ router.delete(
   }
 );
 
-module.exports = router;
+// ---------------------------------------------------------------------------
+// Order templates / ID card design / order configuration manager.
+// All editable in the frontend template page (partner Q3).
+// ---------------------------------------------------------------------------
+router.post(
+  '/templates',
+  authorize('authority', 'admin'),
+  async (req, res) => {
+    try {
+      const { kind, display_name, dataBase64, uploadedBy } = req.body || {};
+      if (!kind || !ALLOWED_KINDS.includes(kind)) {
+        return res.status(400).json({ ok: false, error: 'kind is required (' + ALLOWED_KINDS.join(', ') + ')' });
+      }
+      if (!file_name || typeof file_name !== 'string') {
+        return res.status(400).json({ ok: false, error: 'file_name is required' });
+      }
+      if (!dataBase64 || typeof dataBase64 !== 'string') {
+        return res.status(400).json({ ok: false, error: 'dataBase64 is required' });
+      }
+      const buffer = Buffer.from(dataBase64, 'base64');
+      if (buffer.length === 0 || buffer.length > MAX_FILE_BYTES) {
+        return res.status(400).json({ ok: false, error: 'Invalid file size (0..15MB)' });
+      }
+      assertFile(buffer);
+      const { upsertOrderTemplate } = require('./intake.service');
+      const result = await upsertOrderTemplate({
+        kind,
+        display_name,
+        file: buffer,
+        file_name,
+        uploadedBy: req.session.user.id,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      if (err.message === 'unknown template kind') return res.status(400).json({ ok: false, error: err.message });
+      console.error('template upload failed:', err);
+      res.status(500).json({ ok: false, error: 'Template upload failed' });
+    }
+  }
+);
+
+router.get('/templates', authorize('staff', 'authority', 'admin'), async (_req, res) => {
+  try {
+    const { getOrderTemplates } = require('./intake.service');
+    const { templates } = await getOrderTemplates();
+    res.json({ ok: true, templates });
+  } catch (err) {
+    console.error('list templates failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load templates' });
+  }
+});
+
+router.get(
+  '/templates/:kind',
+  authorize('staff', 'authority', 'admin'),
+  async (req, res) => {
+    try {
+      const { kind } = req.params;
+      const { getOrderTemplate } = require('./intake.service');
+      const file = await getOrderTemplate(kind);
+      if (!file) return res.status(404).json({ ok: false, error: 'template not found' });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+      res.send(file.buffer);
+    } catch (err) {
+      console.error('get template failed:', err);
+      res.status(500).json({ ok: false, error: 'Failed to load template' });
+    }
+  }
+);
+
+router.get(
+  '/order-config',
+  authorize('staff', 'authority', 'admin'),
+  async (_req, res) => {
+    try {
+      const { getOrderConfig } = require('./intake.service');
+      const { config } = await getOrderConfig();
+      res.json({ ok: true, config });
+    } catch (err) {
+      console.error('order config failed:', err);
+      res.status(500).json({ ok: false, error: 'Failed to load order config' });
+    }
+  }
+);
+
+router.put(
+  '/order-config',
+  authorize('authority', 'admin'),
+  async (req, res) => {
+    try {
+      const config = req.body || {};
+      const { upsertOrderConfig } = require('./intake.service');
+      await upsertOrderConfig({ config, updatedBy: req.session.user.id });
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('order config update failed:', err);
+      res.status(500).json({ ok: false, error: 'Failed to save order config' });
+    }
+  }
+);
+
+router.post(
+  '/idcard-design',
+  authorize('authority', 'admin'),
+  async (req, res) => {
+    try {
+      const { design } = req.body || {};
+      if (!design || typeof design !== 'object') {
+        return res.status(400).json({ ok: false, error: 'design object required' });
+      }
+      const { upsertIdCardDesign } = require('./intake.service');
+      await upsertIdCardDesign({
+        design,
+        updatedBy: req.session.user.id,
+      });
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('idcard design failed:', err);
+      res.status(500).json({ ok: false, error: 'Failed to save idcard design' });
+    }
+  }
+);
+
+router.get(
+  '/idcard-design',
+  authorize('staff', 'authority', 'admin'),
+  async (_req, res) => {
+    try {
+      const { getOrderTemplates } = require('./intake.service');
+      // Design lives in its own table; placeholder object until designer route.
+      res.json({ ok: true, design: {} });
+    } catch (err) {
+      console.error('idcard design load failed:', err);
+      res.status(500).json({ ok: false, error: 'Failed to load idcard design' });
+    }
+  }
+);
