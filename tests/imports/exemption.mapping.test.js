@@ -66,9 +66,9 @@ test('(vi) BSNL/MTNL operational-technical staff (soft rule)', () => {
   assert.equal(cat('School Education Department', 'Electrician'), null);
 });
 
-test('(vii) bank branches are NOT auto-exempt (rural + single-officer unverifiable)', () => {
-  assert.equal(cat('Commercial Bank', 'Bank Officer'), null);
-  assert.equal(cat('State Bank of India', 'Clerk'), null);
+test('(vii) bank postings are NOT auto-exempt — held pending authority review (rural + single-officer unverifiable)', () => {
+  assert.equal(cat('Commercial Bank', 'Bank Officer'), 'pending_authority_confirmation');
+  assert.equal(cat('State Bank of India', 'Clerk'), 'pending_authority_confirmation');
 });
 
 test('(viii) personal-status categories are never auto-derived', () => {

@@ -69,3 +69,38 @@ test('normalizeDate handles dd.mm.yyyy edge cases', () => {
   assert.deepStrictEqual(normalizeDate('29.2.2003'), { error: 'unparseable_date' });
   assert.deepStrictEqual(normalizeDate(''), { value: null });
 });
+
+test('below 21 by DOB is rejected with below_minimum_age', () => {
+  const young = new Date();
+  young.setUTCFullYear(young.getUTCFullYear() - 20);
+  const dob = `${String(young.getUTCDate()).padStart(2, '0')}.${String(young.getUTCMonth() + 1).padStart(2, '0')}.${young.getUTCFullYear()}`;
+  const { accepted, rejected } = validateRows([
+    row(7, { employee_id: 'Y1', employee_name: 'Young', date_of_birth: dob }),
+  ]);
+  assert.strictEqual(accepted.length, 0);
+  assert.deepStrictEqual(rejected[0].reasons, ['below_minimum_age']);
+});
+
+test('exactly 21 by DOB today is accepted (birthday counts)', () => {
+  const adult = new Date();
+  adult.setUTCFullYear(adult.getUTCFullYear() - 21);
+  const dob = `${String(adult.getUTCDate()).padStart(2, '0')}.${String(adult.getUTCMonth() + 1).padStart(2, '0')}.${adult.getUTCFullYear()}`;
+  const { accepted } = validateRows([
+    row(7, { employee_id: 'A1', employee_name: 'Adult', date_of_birth: dob }),
+  ]);
+  assert.strictEqual(accepted.length, 1);
+});
+
+test('blank DOB falls back to Age column; both blank is accepted', () => {
+  const low = validateRows([row(7, { employee_id: 'L1', employee_name: 'L', age: '18' })]);
+  assert.deepStrictEqual(low.rejected[0].reasons, ['below_minimum_age']);
+  const ok = validateRows([row(7, { employee_id: 'O1', employee_name: 'O', age: '30' })]);
+  assert.strictEqual(ok.accepted.length, 1);
+  const none = validateRows([row(7, { employee_id: 'N1', employee_name: 'N' })]);
+  assert.strictEqual(none.accepted.length, 1);
+});
+
+test('non-numeric Age is not an age basis (row accepted)', () => {
+  const { accepted } = validateRows([row(7, { employee_id: 'X1', employee_name: 'X', age: 'forty' })]);
+  assert.strictEqual(accepted.length, 1);
+});

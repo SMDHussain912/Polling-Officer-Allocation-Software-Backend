@@ -26,7 +26,7 @@
 const express = require('express');
 const pool = require('../../database');
 const { requireAuth, authorize } = require('../../middleware/auth');
-const { persistPersonnelImport } = require('./import.service');
+const { persistPersonnelImport, patchPersonnelExemption } = require('./import.service');
 const { ImportParseError } = require('./excel.parser');
 
 const MAX_FILE_BYTES = 15 * 1024 * 1024; // decoded size cap (~15 MB)
@@ -182,5 +182,32 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
     res.status(500).json({ ok: false, error: 'Failed to load personnel' });
   }
 });
+
+// Personal exemption workflow (circular p.61(a)(viii) + p.61(a)(vii) bank).
+// Marker is updated only; the response never exposes medical status.
+router.patch(
+  '/batches/:batchId/personnel/:id/exemption',
+  authorize('authority', 'admin'),
+  async (req, res) => {
+    const id = Number(req.params.id);
+    try {
+      const result = await patchPersonnelExemption({
+        id,
+        exemptCategory: req.body?.exemptCategory,
+        note: (req.body && req.body.note) || '',
+        req,
+      });
+      res.json({ ok: true, id: result.id });
+    } catch (err) {
+      console.error('patch personnel exemption failed:', err.message);
+      const status = err.message === 'personnel not found' ? 404
+        : err.message === 'unauthorized category' ? 400
+        : err.message === 'invalid personnel id' ? 400
+        : err.message === 'note must be a string up to 400 characters' ? 400
+        : 400;
+      res.status(status).json({ ok: false, error: err.message });
+    }
+  }
+);
 
 module.exports = router;

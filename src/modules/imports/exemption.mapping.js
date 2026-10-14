@@ -25,16 +25,22 @@
  *        "only in unavoidable circumstances" (not a blanket ban), so these
  *        are marked exempt by default and the authority may override later.
  *
- * Deliberately NOT auto-resolved (data absent — left NULL, never guessed):
+ * Deliberately NOT auto-exempt (data absent — marked pending instead):
  *  (vii) Rural single-officer bank branches: the sheet carries neither the
- *        posting location nor the branch staffing. A "Bank" designation or
- *        department alone does NOT exempt.
+ *        posting location nor the branch staffing, so bank postings resolve to
+ *        pending_authority_confirmation via the overridable BANK_REVIEW
+ *        patterns. The authority resolves each one to an official category or
+ *        clears it; Stage 1 finalizes nothing until then.
  *  (viii) Pregnancy / breastfeeding / medical unfitness: personal medical
- *        status, not present in any spreadsheet. Needs an authority flag.
+ *        status, not present in any spreadsheet. Set only through the
+ *        authorized personnel-exemption endpoint (audit-logged), never by
+ *        import matching.
  *
- * resolveExemption(departmentName, designation) -> { category, rule } | null
- * `category` matches the EXEMPT_CATEGORY string values so Stage 1's filter
- * (which checks membership) works without any change.
+ * resolveExemption(departmentName, designation, opts?) ->
+ *   { category, rule } | null
+ * `category` matches the EXEMPT_CATEGORY string values (or the procedural
+ * pending marker) so Stage 1's filter works without any change.
+ * opts.bankReview overrides BANK_REVIEW for tests / confirmed criteria.
  */
 
 const DEPT = {
@@ -44,7 +50,38 @@ const DEPT = {
   AIR: /all\s*india\s*radio|\bair\b|prasar\s*bharati/i,
   DOORDARSHAN: /doordarshan/i,
   BSNL: /\bbsnl\b|\bmtnl\b/i,
+  BANK: /\bbank\b|\bsbi\b|canara|union\s*bank|bank\s*of|andhra\s*bank/i,
 };
+
+/**
+ * [P] Bank review patterns (circular p.61(a)(vii)): personnel whose bank
+ * posting matches these signals need rural/single-officer-branch criteria the
+ * sheet does not carry, so they are marked pending_authority_confirmation —
+ * never silently eligible, never silently exempt.
+ *
+ * Frozen (accidental tightening/loosening is a policy change); callers needing
+ * different matchers (tests, future authority-confirmed criteria) pass them
+ * via resolveExemption(dept, desig, { bankReview }). The official decision
+ * criteria themselves stay unresolved — see the module docblock.
+ */
+const BANK_REVIEW = Object.freeze({
+  department: DEPT.BANK,
+  designation: /\bbank\b|bank\s*(officer|clerk|manager|cashier)|cashier|\bpo\b.*bank/i,
+  employmentSector: /\bbank\b/i,
+});
+
+const MASKED_MEDICAL_CATEGORIES = Object.freeze(['pregnant', 'breastfeeding']);
+
+/**
+ * Project personnel.exempt_category for ordinary read responses.
+ * Personal medical categories are masked to the generic 'exempt' so medical
+ * status is never exposed outside the authorized marking workflow. All other
+ * stored values (official categories, pending marker, null) pass through.
+ */
+function maskExemptCategory(value) {
+  if (MASKED_MEDICAL_CATEGORIES.includes(value)) return 'exempt';
+  return value;
+}
 
 const DESIG = {
   VETERINARY: /veterin/i,
@@ -59,9 +96,11 @@ function has(value, pattern) {
   return typeof value === 'string' && pattern.test(value);
 }
 
-function resolveExemption(departmentName, designation) {
+function resolveExemption(departmentName, designation, opts) {
   const dept = has(departmentName, /.+/s) ? departmentName : '';
   const desig = designation || '';
+  const sector = (opts && opts.employmentSector) || '';
+  const review = (opts && opts.bankReview) || BANK_REVIEW;
 
   // (i) Veterinary hospitals.
   if (has(desig, DESIG.VETERINARY)) {
@@ -100,7 +139,18 @@ function resolveExemption(departmentName, designation) {
     return { category: 'bsnl_mtnl_ops', rule: 'p61(vi)-technical' };
   }
 
+  // (vii) Bank postings with unverifiable rural/single-officer criteria:
+  // pending, never auto-exempt, never silently eligible. Runs AFTER the
+  // genuine exemptions above so a bank-sheet doctor stays a doctor.
+  if (
+    has(dept, review.department) ||
+    has(desig, review.designation) ||
+    has(sector, review.employmentSector)
+  ) {
+    return { category: 'pending_authority_confirmation', rule: 'p61(vii)-pending-review' };
+  }
+
   return null;
 }
 
-module.exports = { resolveExemption, DEPT, DESIG };
+module.exports = { resolveExemption, maskExemptCategory, BANK_REVIEW, MASKED_MEDICAL_CATEGORIES, DEPT, DESIG };

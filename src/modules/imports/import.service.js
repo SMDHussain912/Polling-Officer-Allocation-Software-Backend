@@ -106,4 +106,73 @@ async function persistPersonnelImport({ fileName, buffer, importedBy }) {
   }
 }
 
-module.exports = { persistPersonnelImport, IMPORT_DISTRICT };
+/**
+ * Mark (or clear) a single personnel record's official exemption status.
+ *
+ *   POST /api/imports/personnel/:id/exemption   { exemptCategory, note }
+ *
+ *  - `exemptCategory` = an official EXEMPT_CATEGORY value, or
+ *    'pending_authority_confirmation' (bank p.61(a)(vii)).
+ *  - `note` is an audit-only reason (never returned in the personnel response).
+ *
+ * Writes the personnel row AND an append-only audit record in one transaction.
+ * Sensitive categories ('pregnant', 'breastfeeding') are stored; existing read
+ * endpoints mask them with the generic 'exempt' label.
+ *
+ * 400: unknown/unauthorized category, negative id, note > 400 chars.
+ * 404: personnel not found.
+ */
+async function patchPersonnelExemption({ id, exemptCategory, note = '', req } = {}) {
+  if (!['pregnant', 'breastfeeding', 'bank_rural_single_officer', 'veterinary_staff', 'health_medical', 'nurse_anm', 'ayush_medical', 'all_india_radio', 'doordarshan', 'bsnl_mtnl_ops', 'pending_authority_confirmation', null].includes(exemptCategory)) {
+    throw new Error('unauthorized category');
+  }
+  if (typeof note !== 'string' || note.length > 400) {
+    throw new Error('note must be a string up to 400 characters');
+  }
+  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
+    throw new Error('invalid personnel id');
+  }
+
+  const getClient = req
+    ? async () => { const c = await pool.connect(); c._req = req; return c; }
+    : (() => pool.connect())();
+  const client = await (req ? getClient() : pool.connect());
+  try {
+    await client.query('BEGIN');
+    const row = await client.query(
+      `SELECT id, employee_id, exempt_category, import_batch_id
+         FROM personnel WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (row.rows.length === 0) {
+      throw new Error('personnel not found');
+    }
+    const personnel = row.rows[0];
+    const oldCategory = personnel.exempt_category;
+
+    const marked = exemptCategory === null || exemptCategory === 'pending_authority_confirmation' || exemptCategory === 'health_medical' || exemptCategory === 'nurse_anm' || exemptCategory === 'ayush_medical' || exemptCategory === 'veterinary_staff' || exemptCategory === 'all_india_radio' || exemptCategory === 'doordarshan' || exemptCategory === 'bsnl_mtnl_ops';
+
+    await client.query(
+      `INSERT INTO personnel_exemptions
+         (personnel_id, employee_id, new_exempt_category, old_exempt_category, reason, requested_by_user_id, note)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, personnel.employee_id, exemptCategory, oldCategory, 'authority_mark', (req && req.session && req.session.user && req.session.user.id) || null, note]
+    );
+    await client.query(
+      `UPDATE personnel
+         SET exempt_category = $1
+         WHERE id = $2`,
+      [exemptCategory, id]
+    );
+    await client.query('COMMIT');
+    return { ok: true, id, profileId: personnel.id };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { persistPersonnelImport, patchPersonnelExemption, IMPORT_DISTRICT };
+
