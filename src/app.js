@@ -3,6 +3,12 @@ const session = require('express-session');
 const config = require('./config');
 const authRoutes = require('./modules/auth');
 const importRoutes = require('./modules/imports');
+const masterDataRoutes = require('./modules/master-data');
+const randomizationRoutes = require('./modules/randomization/routes');
+const { createAppStage1Router } = require('./modules/randomization-stage-1/wiring');
+const notificationRoutes = require('./modules/notifications');
+const reportsRoutes = require('./modules/reports');
+const trainingRoutes = require('./modules/training');
 
 const app = express();
 
@@ -18,5 +24,11 @@ app.use(
 
 app.use('/api/auth', authRoutes);
 app.use('/api/imports', importRoutes);
+app.use('/api/master-data', masterDataRoutes);
+app.use('/api/randomization/stage-1', createAppStage1Router());
+app.use('/api/randomization', randomizationRoutes);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/reports', reportsRoutes);
+app.use('/api/training', trainingRoutes);
 
 module.exports = app;

@@ -1,0 +1,185 @@
+'use strict';
+
+/**
+ * Randomization orchestration router.
+ *
+ *   POST /api/randomization/run      Stage 1 -> Stage 2 (+MO) -> Stage 3
+ *   POST /api/randomization/publish  authorised disclosure of a Stage 3 mapping
+ *
+ * Executes Stage 1 -> Stage 2 -> Stage 3 in-process over existing pure
+ * services, sourcing personnel and polling stations from the database.
+ *
+ * Authorization: session required + authorize('authority','admin') — random
+ * stage execution policy (established in the import-route wiring step).
+ *
+ * Request body for /run (authority-supplied, never derived by the server):
+ *   {
+ *     electionConfiguration: { id, requiredStrength: [{mandalId, requiredCount}] },
+ *     designationRules: { designation: { seniorityRank, presidingEligible, microObserverEligible } },
+ *     personnelImportBatchId?: number,   // default: latest personnel batch
+ *     stationImportBatchId: number,      // required: stations scoped to one batch
+ *     districtId?: string,               // default 'Kakinada'
+ *     seed?: number                      // reproducible demo runs
+ *   }
+ *
+ * Publish body: { stage3Run } — Stage 3's executeMapping output. Refuses
+ * anything that is not a completed, still-confidential mapping.
+ *
+ * Response: { ok, stage1, stage2, stage3, auditEvents } — no sensitive
+ * personnel fields are read or returned (explicit column allow-list below).
+ */
+
+const express = require('express');
+const pool = require('../../database');
+const { requireAuth, authorize } = require('../../middleware/auth');
+const { runAllocation } = require('./orchestrator');
+const { recordRun, recordPublication, getLastRun } = require('./allocation-store');
+// Integration hook: register the AUTHORITY-SUPPLIED election configuration so
+// the standalone Stage 1 router can resolve it by id. Pure registration.
+const { registerElectionConfiguration } = require('../randomization-stage-1/wiring');
+
+const router = express.Router();
+
+// Session first (401), then role gate (403). Never bypass either.
+router.use(requireAuth);
+router.use(authorize('authority', 'admin'));
+
+// Explicit non-sensitive column allow-list. Aadhaar / voter ID / mobile are
+// never selected here (same policy as the personnel read endpoint).
+const PERSONNEL_COLUMNS =
+  'employee_id, employee_name, designation, is_active, district, ' +
+  'work_mandal, native_mandal, exempt_category, import_batch_id';
+
+router.post('/run', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const districtId = body.districtId || 'Kakinada';
+    const electionConfiguration = body.electionConfiguration;
+    const designationRules = body.designationRules;
+
+    if (!electionConfiguration || typeof electionConfiguration !== 'object') {
+      return res.status(400).json({ ok: false, error: 'electionConfiguration is required' });
+    }
+    if (!designationRules || typeof designationRules !== 'object' || Array.isArray(designationRules)) {
+      return res.status(400).json({ ok: false, error: 'designationRules is required' });
+    }
+    const stationBatchId = Number(body.stationImportBatchId);
+    if (!Number.isSafeInteger(stationBatchId) || stationBatchId <= 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'stationImportBatchId (positive integer) is required' });
+    }
+
+    // --- Load polling stations (scoped to ONE import batch, per decision). --
+    const stationsResult = await pool.query(
+      'SELECT station_id, station_number, mandal FROM polling_stations WHERE import_batch_id = $1 LIMIT 5000',
+      [stationBatchId]
+    );
+    if (stationsResult.rows.length === 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'No polling stations found for stationImportBatchId ' + stationBatchId });
+    }
+
+    // --- Load personnel (one batch: explicit, or the latest personnel batch).
+    let personnelBatchId = Number(body.personnelImportBatchId);
+    if (!Number.isSafeInteger(personnelBatchId) || personnelBatchId <= 0) {
+      const latest = await pool.query(
+        "SELECT id FROM import_batches WHERE kind = 'personnel' AND status = 'completed' ORDER BY id DESC LIMIT 1"
+      );
+      if (latest.rows.length === 0) {
+        return res.status(400).json({ ok: false, error: 'No completed personnel import batch found' });
+      }
+      personnelBatchId = latest.rows[0].id;
+    }
+    const personnelResult = await pool.query(
+      'SELECT ' + PERSONNEL_COLUMNS + ' FROM personnel WHERE import_batch_id = $1 AND district = $2 LIMIT 5000',
+      [personnelBatchId, districtId]
+    );
+    if (personnelResult.rows.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'No personnel found in batch ' + personnelBatchId + ' for district ' + districtId,
+      });
+    }
+
+    // Department name (office grouping fallback for the Stage 2 same-office
+    // rule). The proforma has no office/school column, so the request may
+    // carry an explicit officeIdOverrides map { employeeId: officeId };
+    // without it all rows share the department as their office.
+    const batchResult = await pool.query(
+      'SELECT department_name FROM import_batches WHERE id = $1',
+      [personnelBatchId]
+    );
+    const departmentName = batchResult.rows[0] ? batchResult.rows[0].department_name : null;
+    const officeIdOverrides =
+      body.officeIdOverrides && typeof body.officeIdOverrides === 'object' &&
+      !Array.isArray(body.officeIdOverrides)
+        ? body.officeIdOverrides
+        : undefined;
+
+    // Make the authority-supplied configuration resolvable by id for the
+    // standalone Stage 1 endpoints (registered as-is; nothing derived).
+    registerElectionConfiguration(electionConfiguration);
+
+    // --- Execute the three-stage chain. ---------------------------------
+    const result = await runAllocation({
+      personnelRows: personnelResult.rows,
+      stationRows: stationsResult.rows,
+      departmentName: departmentName,
+      officeIdOverrides: officeIdOverrides,
+      electionConfiguration: electionConfiguration,
+      designationRules: designationRules,
+      districtId: districtId,
+      actorId: req.session.user.id,
+      seed: body.seed,
+    });
+
+    recordRun({
+      runAt: new Date().toISOString(),
+      runBy: { id: req.session.user.id, username: req.session.user.username, role: req.session.user.role },
+      ...result,
+    });
+
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    const status = err && err.statusCode ? err.statusCode : 500;
+    const message =
+      status >= 500 && process.env.NODE_ENV === 'production'
+        ? 'Allocation failed'
+        : (err && err.message) || 'Allocation failed';
+    if (status >= 500) console.error('randomization run failed:', err);
+    res.status(status).json({ ok: false, error: message });
+  }
+});
+
+// Confidential -> published transition for a completed Stage 3 mapping.
+// Records WHO confirmed it (session user) and WHEN — the disclosure decision
+// is the authorized officer's, not automatic. Refuses incomplete or already
+// published runs (fail closed).
+router.post('/publish', async (req, res) => {
+  try {
+    const stage3Run = req.body && req.body.stage3Run;
+    if (!stage3Run || typeof stage3Run !== 'object') {
+      return res.status(400).json({ ok: false, error: 'stage3Run (Stage 3 mapping object) is required' });
+    }
+    const { createStage3Service } = require('../randomization-stage-3');
+    const service = createStage3Service();
+    const published = service.publish(stage3Run);
+    const publishedAt = new Date().toISOString();
+    const confirmedBy = { id: req.session.user.id, username: req.session.user.username, role: req.session.user.role };
+    recordPublication(published, confirmedBy);
+    res.json({
+      ok: true,
+      stage3: published,
+      confirmedBy: confirmedBy,
+      confirmedAt: publishedAt,
+    });
+  } catch (err) {
+    const status = err && err.statusCode ? err.statusCode : 500;
+    if (status >= 500) console.error('randomization publish failed:', err);
+    res.status(status).json({ ok: false, error: (err && err.message) || 'Publish failed' });
+  }
+});
+
+module.exports = router;
