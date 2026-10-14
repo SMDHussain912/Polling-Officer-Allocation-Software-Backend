@@ -6,17 +6,26 @@
  *   POST /api/imports/personnel   upload one proforma workbook (base64 JSON)
  *   GET  /api/imports/batches     recent import batches (traceability)
  *   GET  /api/imports/batches/:id/personnel
- *          full personnel rows accepted in one batch (all proforma columns)
+ *          accepted personnel rows in one batch (all proforma columns)
+ *   GET  /api/imports/batches/:id/rejected
+ *          rejected rows stored for one batch (status + reasons + raw values)
  *
  * Upload format: { "fileName": "...", "dataBase64": "<file as base64>" }.
  * (JSON instead of multipart so no extra upload package is needed; the file
  * content never touches disk.)
+ *
+ * Both accepted AND rejected rows are stored (team decision 2026-10-14):
+ * accepted -> personnel (import_status='accepted'), rejected ->
+ * import_rejected_rows (import_status='rejected' semantics + reasons).
+ * Every read comes from the DB; the frontend never renders a local-file
+ * fallback as if it were stored data.
  *
  * Authorization: session required (router.use(requireAuth)). Role policy is
  * enforced per route with authorize(...roles):
  *   POST /personnel                 -> authority, admin
  *   GET  /batches                   -> staff, authority, admin (read-only)
  *   GET  /batches/:id/personnel     -> staff, authority, admin (read-only)
+ *   GET  /batches/:id/rejected      -> staff, authority, admin (read-only)
  *
  * The personnel read endpoint uses an explicit column allow-list covering
  * every proforma column the import step stores (see import.service.js
@@ -182,6 +191,44 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
     res.status(500).json({ ok: false, error: 'Failed to load personnel' });
   }
 });
+
+// Rejected rows stored for one batch (import_status='rejected' semantics).
+// Returns { ok, batch, count, rejected: [{ sheetRow, employeeId, reasons,
+// rawValues }] } straight from import_rejected_rows — no local fallback.
+router.get(
+  '/batches/:id/rejected',
+  authorize('staff', 'authority', 'admin'),
+  async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      return res.status(400).json({ ok: false, error: 'Invalid batch id' });
+    }
+    try {
+      const batchResult = await pool.query('SELECT * FROM import_batches WHERE id = $1', [id]);
+      if (batchResult.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: 'Batch not found' });
+      }
+      const result = await pool.query(
+        `SELECT id, sheet_row, employee_id, reasons, raw_values
+           FROM import_rejected_rows
+          WHERE import_batch_id = $1
+          ORDER BY sheet_row NULLS LAST, id`,
+        [id]
+      );
+      const rejected = result.rows.map((r) => ({
+        sheetRow: r.sheet_row,
+        employeeId: r.employee_id,
+        reasons: r.reasons || [],
+        rawValues: r.raw_values || {},
+        importStatus: 'rejected',
+      }));
+      res.json({ ok: true, batch: batchResult.rows[0], count: rejected.length, rejected });
+    } catch (err) {
+      console.error('list batch rejected rows failed:', err);
+      res.status(500).json({ ok: false, error: 'Failed to load rejected rows' });
+    }
+  }
+);
 
 // Personal exemption workflow (circular p.61(a)(viii) + p.61(a)(vii) bank).
 // Marker is updated only; the response never exposes medical status.

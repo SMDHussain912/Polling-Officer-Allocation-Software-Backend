@@ -3,10 +3,11 @@
 /**
  * Stage: imports — persistence for a personnel import.
  *
- * One import = one import_batches row + accepted rows in personnel, written
- * atomically (single transaction). Rejected rows are NOT stored as personnel
- * rows; they are returned to the caller as { sheetRow, reasons } so the
- * operator can fix the sheet and re-upload (batch keeps the counts).
+ * One import = one import_batches row + accepted rows in personnel +
+ * rejected rows in import_rejected_rows, written atomically (single
+ * transaction). Rejected rows carry import_status='rejected' semantics via
+ * their own table + the reasons array, so the frontend always renders stored
+ * DB data (never a local-file fallback).
  *
  * District is stamped per the confirmed single-district scope (Kakinada).
  */
@@ -84,6 +85,25 @@ async function persistPersonnelImport({ fileName, buffer, importedBy }) {
       await client.query(INSERT_SQL, [batchId, IMPORT_DISTRICT, exemptCategory, ...values]);
     }
 
+    // Team decision 2026-10-14: rejected rows are stored too (same batch,
+    // same transaction) in import_rejected_rows with reasons, so the frontend
+    // always renders stored DB data and never a local-file fallback.
+    for (const rej of rejected) {
+      const rawRow = rows.find((r) => r.sheetRow === rej.sheetRow);
+      await client.query(
+        `INSERT INTO import_rejected_rows
+           (import_batch_id, sheet_row, employee_id, reasons, raw_values)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          batchId,
+          rej.sheetRow ?? null,
+          rej.employeeId ?? null,
+          JSON.stringify(rej.reasons || []),
+          JSON.stringify((rawRow && rawRow.values) || {}),
+        ]
+      );
+    }
+
     await client.query(
       `UPDATE import_batches SET status = 'completed' WHERE id = $1`,
       [batchId]
@@ -133,10 +153,7 @@ async function patchPersonnelExemption({ id, exemptCategory, note = '', req } = 
     throw new Error('invalid personnel id');
   }
 
-  const getClient = req
-    ? async () => { const c = await pool.connect(); c._req = req; return c; }
-    : (() => pool.connect())();
-  const client = await (req ? getClient() : pool.connect());
+  const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const row = await client.query(
