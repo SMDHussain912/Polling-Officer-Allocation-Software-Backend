@@ -11,6 +11,23 @@ const { validateStage2Request } = require('./stage2.validator');
 const { isMandalBarred } = require('./stage2.mandal');
 const formation = require('./stage2.formation');
 
+/**
+ * Team-level 20% substitution (team decision 2026-10-14): this is PER TEAM,
+ * not per mandal. A full team (e.g. PO + MO + 5 officers = 7) gets
+ * ceil(teamSize x 20%) extra members drawn from the leftover pool as
+ * substitutes (e.g. 7 x 0.2 = 1.4 -> 2). Substitutes are deployment-ready
+ * backups attached to their team; a team whose substitutes cannot be filled
+ * is reported, never silently left short.
+ */
+const SUBSTITUTE_FRACTION_NUMERATOR = 1;
+const SUBSTITUTE_FRACTION_DENOMINATOR = 5;
+
+function substituteCountFor(teamSize) {
+  return Math.ceil(
+    (teamSize * SUBSTITUTE_FRACTION_NUMERATOR) / SUBSTITUTE_FRACTION_DENOMINATOR
+  );
+}
+
 function createStage2Service(deps) {
   deps = deps || {};
   const randomInt = deps.randomInt;
@@ -26,6 +43,7 @@ function createStage2Service(deps) {
     const electionShort = formation.electionShortOf(t.stage1Run.electionConfigurationId);
     let parties = [];
     let shortageParties = 0;
+    let substituteShortfall = [];
     if (t.options.allowShortageFallback) {
       // Two-phase: full 1+5 parties first, then 1+4 parties (merged 3rd+4th
       // duty on ONE person) from whoever is left. partiesRequested caps the
@@ -92,6 +110,46 @@ function createStage2Service(deps) {
       };
       });
       verifyInvariants(t.employees, parties, partySize);
+
+      // --- 20% substitutes per team (team decision 2026-10-14). ----------------
+      // Drawn from the unassigned leftover AFTER core formation. Each team of
+      // size N gets ceil(N x 20%) substitutes (e.g. 7 -> 2). Shortfall is
+      // reported per team, never silently left short. Drawn from t.employees
+      // (full records) so substitutes carry office/seniority fields.
+      var coreKeys = {};
+      parties.forEach(function (party) {
+        party.members.forEach(function (m) { coreKeys[String(m.personnelId)] = true; });
+      });
+      var stillFree = t.employees.filter(function (e) { return !coreKeys[String(e.personnelKey)]; });
+      var subIdx = 0;
+      substituteShortfall = [];
+      parties.forEach(function (party) {
+        var need = substituteCountFor(party.members.length);
+        party.substitutes = [];
+        party.substitutesRequired = need;
+        for (var s = 0; s < need; s += 1) {
+          if (subIdx >= stillFree.length) {
+            substituteShortfall.push({ teamCode: party.teamCode, missing: need - s });
+            break;
+          }
+          var sub = stillFree[subIdx++];
+          party.substitutes.push({
+            personnelId: sub.personnelId,
+            name: sub.name,
+            designation: sub.designation,
+            officeId: sub.officeId,
+            officeName: sub.officeName,
+            seniorityRank: sub.seniorityRank,
+            classification: sub.classification,
+            substituteFor: party.teamCode,
+          });
+        }
+      });
+      parties.forEach(function (party) {
+        (party.substitutes || []).forEach(function (m) {
+          coreKeys[String(m.personnelId)] = true;
+        });
+      });
     }
     const excelRows = formation.toExcelRows(parties.map(function (p) {
       return {
@@ -112,6 +170,7 @@ function createStage2Service(deps) {
     const usedKeys = new Set();
     parties.forEach(function (p) {
       p.members.forEach(function (m) { usedKeys.add(String(m.personnelId)); });
+      (p.substitutes || []).forEach(function (m) { usedKeys.add(String(m.personnelId)); });
     });
     const unassigned = t.employees.filter(function (e) {
       return !usedKeys.has(e.personnelKey);
@@ -123,7 +182,10 @@ function createStage2Service(deps) {
         reason: held ? 'reserve_held' : 'no_eligible_party_slot',
       };
     });
-    const unmetRequirements = [];
+    const unmetRequirements = substituteShortfall.map(function (st) {
+      return { code: 'SUBSTITUTES_SHORT', teamCode: st.teamCode, missing: st.missing,
+        message: 'Team could not be given its full 20% substitutes; leftover pool exhausted.' };
+    });
     if (t.options.partiesRequested > 0 && parties.length < t.options.partiesRequested) {
       unmetRequirements.push({
         code: 'PARTIES_SHORTFALL', requested: t.options.partiesRequested, formed: parties.length,
@@ -136,7 +198,7 @@ function createStage2Service(deps) {
     const complete = unmetRequirements.length === 0;
     const teamSizes = parties.map(function (p) { return p.members.length; });
     return {
-      status: complete ? STAGE2_STATUS.COMPLETED : STAGE2_STATUS.INCOMPLETE,
+      status: complete && unmetRequirements.length === 0 ? STAGE2_STATUS.COMPLETED : STAGE2_STATUS.INCOMPLETE,
       stage: STAGE_NUMBER, stage1RunId: t.stage1Run.runId,
       electionConfigurationId: t.stage1Run.electionConfigurationId,
       districtId: t.stage1Run.districtId,
@@ -148,6 +210,7 @@ function createStage2Service(deps) {
       pollingOfficersPerParty: t.options.pollingOfficersPerParty,
       shortageReason: t.options.shortageReason,
       parties: parties, excelRows: excelRows, unassigned: unassigned,
+      substituteCount: parties.reduce(function (n, party) { return n + (party.substitutes || []).length; }, 0),
       reserveHeld: reserveHeld.map(function (e) {
         return { personnelId: e.personnelId, name: e.name, classification: e.classification };
       }),
