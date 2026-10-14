@@ -78,6 +78,17 @@ const EXEMPT_CATEGORY = Object.freeze({
 const ALL_EXEMPT_CATEGORIES = Object.freeze(Object.values(EXEMPT_CATEGORY));
 
 /**
+ * [P] Procedural marker for circular p.61(a)(vii) bank personnel whose
+ * rural/single-officer-branch criteria cannot be verified from sheet data,
+ * and for manually flagged records awaiting an authority decision.
+ * Deliberately NOT a member of ALL_EXEMPT_CATEGORIES: it is an UNRESOLVED
+ * state, not an exemption. Stage 1 treats it as not-finalized (rejected with
+ * reason pending_authority_confirmation) regardless of any custom
+ * exemptCategories scope — never silently eligible, never silently exempt.
+ */
+const PENDING_AUTHORITY_CONFIRMATION = 'pending_authority_confirmation';
+
+/**
  * [O] The manual requires personnel records for randomization to carry, among
  * others: Name, Gender, Contact No. (Mobile), Designation, Office and
  * Department/Institution, Place of residence, Work place, Native Mandal,
@@ -129,6 +140,7 @@ module.exports = {
   PER_POLLING_STATION,
   EXEMPT_CATEGORY,
   ALL_EXEMPT_CATEGORIES,
+  PENDING_AUTHORITY_CONFIRMATION,
   REQUIRED_PERSONNEL_ATTRIBUTES,
   POOL_CLASSIFICATION,
   RUN_STATUS,
