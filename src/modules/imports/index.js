@@ -562,4 +562,6 @@ router.get(
       res.status(500).json({ ok: false, error: 'Failed to load idcard design' });
     }
   }
+
 );
+module.exports = router;
