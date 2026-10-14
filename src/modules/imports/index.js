@@ -6,7 +6,7 @@
  *   POST /api/imports/personnel   upload one proforma workbook (base64 JSON)
  *   GET  /api/imports/batches     recent import batches (traceability)
  *   GET  /api/imports/batches/:id/personnel
- *          personnel accepted in one batch (sensitive fields excluded)
+ *          full personnel rows accepted in one batch (all proforma columns)
  *
  * Upload format: { "fileName": "...", "dataBase64": "<file as base64>" }.
  * (JSON instead of multipart so no extra upload package is needed; the file
@@ -18,9 +18,9 @@
  *   GET  /batches                   -> staff, authority, admin (read-only)
  *   GET  /batches/:id/personnel     -> staff, authority, admin (read-only)
  *
- * The personnel read endpoints use an explicit column allow-list and never
- * return Aadhaar, voter ID or mobile number (see the handler below); do not
- * change them to SELECT *.
+ * The personnel read endpoint uses an explicit column allow-list covering
+ * every proforma column the import step stores (see import.service.js
+ * PERSONNEL_COLUMNS); it never uses SELECT *.
  */
 
 const express = require('express');
@@ -90,8 +90,9 @@ router.get('/batches', authorize('staff', 'authority', 'admin'), async (req, res
 });
 
 // Personnel accepted in a single import batch (review-before-use).
-// Explicit column allow-list: Aadhaar, voter ID and mobile number are NOT
-// selected, so they cannot leak through the response, errors or debug output.
+// Returns the FULL accepted row (all proforma columns) so Phase 1 can render
+// the total uploaded data. Projection stays an EXPLICIT column list
+// (never SELECT *) — the same columns the import step writes.
 // 404 on an unknown batch; invalid ids -> 400.
 router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), async (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
@@ -110,25 +111,33 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
       return res.status(404).json({ ok: false, error: 'Import batch not found' });
     }
 
+    // FULL data: every proforma column stored at import time, no row cap, so
+    // Phase 1 shows the same total data that is present in the database.
     const result = await pool.query(
-      `SELECT id, employee_id, employee_name, designation, gender, gazetted_status,
-              work_mandal, native_mandal, working_constituency_name, import_status
+      `SELECT id, import_batch_id, import_status, district,
+              sl_no, employee_id, employee_name, designation, gender, age,
+              aadhar_number, languages_known, employment_sector, scale_of_pay,
+              basic_pay, gazetted_status, date_of_birth, date_of_retirement,
+              employment_type, enrolled_assembly_constituency, part_no_vote_sl_no,
+              voter_id, residence_address, residence_constituency_code,
+              residence_constituency_name, work_mandal, working_constituency_code,
+              working_constituency_name, native_mandal, native_constituency_code,
+              native_constituency_name, previous_po_duty, mobile_no,
+              service_in_district_4y, ph_category, criminal_case_or_eci_orders,
+              exceeded_3_years, eci_ceo_order_details, remarks
          FROM personnel
         WHERE import_batch_id = $1
-        ORDER BY id
-        LIMIT 1000`,
+        ORDER BY id`,
       [id]
     );
 
-    // Defense-in-depth: the SQL above already selects only safe columns, but
-    // we re-project explicitly so Aadhaar / voter ID / mobile can never reach
-    // the response even if the query or schema changes later.
+    // Return raw DB rows (snake_case). The frontend normalizeRow already maps
+    // every one of these keys onto the table, plus camelCase aliases below
+    // for convenience.
     const personnel = result.rows.map((r) => ({
-      id: r.id,
+      ...r,
       employeeId: r.employee_id,
       employeeName: r.employee_name,
-      designation: r.designation,
-      gender: r.gender,
       gazettedStatus: r.gazetted_status,
       workMandal: r.work_mandal,
       nativeMandal: r.native_mandal,
