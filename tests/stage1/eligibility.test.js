@@ -47,7 +47,7 @@ test('optional mandal scoping applies when both sides carry mandalId', () => {
 
 test('[O] every exempt category from the circular is rejected', () => {
   const exempt = [
-    'veterinary_staff', 'nurse_anm', 'ayush_medical', 'all_india_radio',
+    'veterinary_staff', 'health_medical', 'nurse_anm', 'ayush_medical', 'all_india_radio',
     'doordarshan', 'bsnl_mtnl_ops', 'bank_rural_single_officer',
     'pregnant', 'breastfeeding',
   ];

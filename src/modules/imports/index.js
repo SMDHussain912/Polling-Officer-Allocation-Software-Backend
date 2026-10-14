@@ -65,6 +65,7 @@ router.post('/personnel', authorize('authority', 'admin'), async (req, res) => {
         totalRows: result.totalRows,
         acceptedRows: result.acceptedRows,
         rejectedRows: result.rejectedRows,
+        exemptRows: result.exemptRows,
       },
       rejected: result.rejected,
     });
@@ -111,18 +112,22 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
       return res.status(404).json({ ok: false, error: 'Import batch not found' });
     }
 
-    // FULL data: every proforma column stored at import time, no row cap, so
+    // Full data: every proforma column stored at import time, no row cap, so
     // Phase 1 shows the same total data that is present in the database.
+    // Projection stays an EXPLICIT column list (never SELECT *) and NEVER
+    // selects aadhar_number / voter_id / mobile_no — that privacy rule was
+    // approved for this endpoint and must not regress. Full proforma columns
+    // that are safe to display are camelCase-projected for the frontend.
     const result = await pool.query(
-      `SELECT id, import_batch_id, import_status, district,
+      `SELECT id, import_batch_id, import_status, district, exempt_category,
               sl_no, employee_id, employee_name, designation, gender, age,
-              aadhar_number, languages_known, employment_sector, scale_of_pay,
+              languages_known, employment_sector, scale_of_pay,
               basic_pay, gazetted_status, date_of_birth, date_of_retirement,
               employment_type, enrolled_assembly_constituency, part_no_vote_sl_no,
-              voter_id, residence_address, residence_constituency_code,
+              residence_address, residence_constituency_code,
               residence_constituency_name, work_mandal, working_constituency_code,
               working_constituency_name, native_mandal, native_constituency_code,
-              native_constituency_name, previous_po_duty, mobile_no,
+              native_constituency_name, previous_po_duty,
               service_in_district_4y, ph_category, criminal_case_or_eci_orders,
               exceeded_3_years, eci_ceo_order_details, remarks
          FROM personnel
@@ -131,18 +136,44 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
       [id]
     );
 
-    // Return raw DB rows (snake_case). The frontend normalizeRow already maps
-    // every one of these keys onto the table, plus camelCase aliases below
-    // for convenience.
     const personnel = result.rows.map((r) => ({
-      ...r,
+      id: r.id,
+      importBatchId: r.import_batch_id,
+      importStatus: r.import_status,
+      district: r.district,
+      exemptCategory: r.exempt_category,
+      slNo: r.sl_no,
       employeeId: r.employee_id,
       employeeName: r.employee_name,
+      designation: r.designation,
+      gender: r.gender,
+      age: r.age,
+      languagesKnown: r.languages_known,
+      employmentSector: r.employment_sector,
+      scaleOfPay: r.scale_of_pay,
+      basicPay: r.basic_pay,
       gazettedStatus: r.gazetted_status,
+      dateOfBirth: r.date_of_birth,
+      dateOfRetirement: r.date_of_retirement,
+      employmentType: r.employment_type,
+      enrolledAssemblyConstituency: r.enrolled_assembly_constituency,
+      partNoVoteSlNo: r.part_no_vote_sl_no,
+      residenceAddress: r.residence_address,
+      residenceConstituencyCode: r.residence_constituency_code,
+      residenceConstituencyName: r.residence_constituency_name,
       workMandal: r.work_mandal,
-      nativeMandal: r.native_mandal,
+      workingConstituencyCode: r.working_constituency_code,
       workingConstituencyName: r.working_constituency_name,
-      importStatus: r.import_status,
+      nativeMandal: r.native_mandal,
+      nativeConstituencyCode: r.native_constituency_code,
+      nativeConstituencyName: r.native_constituency_name,
+      previousPoDuty: r.previous_po_duty,
+      serviceInDistrict4y: r.service_in_district_4y,
+      phCategory: r.ph_category,
+      criminalCaseOrEciOrders: r.criminal_case_or_eci_orders,
+      exceeded3Years: r.exceeded_3_years,
+      eciCeoOrderDetails: r.eci_ceo_order_details,
+      remarks: r.remarks,
     }));
 
     res.json({ ok: true, batch: batchResult.rows[0], count: personnel.length, personnel });

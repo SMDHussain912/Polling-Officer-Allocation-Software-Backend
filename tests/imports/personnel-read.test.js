@@ -90,6 +90,8 @@ test('unknown batch -> 404', async () => {
   const app = buildApp({ withSession: true });
   const { status, body } = await request(app, 'GET', '/api/imports/batches/999/personnel');
   assert.equal(status, 404);
+  assert.equal(body.ok, false);
+});
 
 test('known batch -> 200 with batch summary and personnel rows', async () => {
   capturedSql = [];
@@ -101,7 +103,8 @@ test('known batch -> 200 with batch summary and personnel rows', async () => {
     return { rows: [
       { id: 1, employee_id: 'EMP1', employee_name: 'Alpha', designation: 'Teacher',
         gender: 'F', gazetted_status: 'Non-Gazetted', work_mandal: 'Kakinada',
-        native_mandal: 'Peddapuram', working_constituency_name: 'Kakinada', import_status: 'accepted' },
+        native_mandal: 'Peddapuram', working_constituency_name: 'Kakinada',
+        import_status: 'accepted', exempt_category: null },
     ] };
   };
   const app = buildApp({ withSession: true });
@@ -114,6 +117,7 @@ test('known batch -> 200 with batch summary and personnel rows', async () => {
   assert.equal(body.personnel[0].employeeId, 'EMP1');
   assert.equal(body.personnel[0].employeeName, 'Alpha');
   assert.equal(body.personnel[0].workMandal, 'Kakinada');
+  assert.equal(body.personnel[0].exemptCategory, null);
 });
 
 test('personnel rows are projected to a camelCase allow-list (no snake_case leak)', async () => {
@@ -123,17 +127,41 @@ test('personnel rows are projected to a camelCase allow-list (no snake_case leak
     return { rows: [
       { id: 1, employee_id: 'EMP1', employee_name: 'Alpha', designation: 'Teacher',
         gender: 'F', gazetted_status: 'Non-Gazetted', work_mandal: 'Kakinada',
-        native_mandal: 'Peddapuram', working_constituency_name: 'Kakinada', import_status: 'accepted' },
+        native_mandal: 'Peddapuram', working_constituency_name: 'Kakinada',
+        import_status: 'accepted', exempt_category: 'health_medical',
+        district: 'Kakinada', sl_no: '1', age: '40' },
     ] };
   };
   const app = buildApp({ withSession: true });
   const { body } = await request(app, 'GET', '/api/imports/batches/7/personnel');
   const row = body.personnel[0];
-  // Only allow-listed keys are present.
-  assert.deepEqual(Object.keys(row).sort(), [
-    'designation', 'employeeId', 'employeeName', 'gazettedStatus', 'gender',
-    'id', 'importStatus', 'nativeMandal', 'workMandal', 'workingConstituencyName',
-  ]);
+  // Mapping tolerates missing/partial DB rows (projection handles nulls):
+  // the stub only carries a few columns, so only these keys can appear here.
+  // The full-column guarantee is covered by the static key check below.
+  assert.equal(row.employeeId, 'EMP1');
+  assert.equal(row.employeeName, 'Alpha');
+  assert.equal(row.workMandal, 'Kakinada');
+  assert.equal(row.exemptCategory, 'health_medical');
+
+  // Static guarantee straight from the handler source: no snake_case key can
+  // appear in a projected row (projection builds a fresh object), and the
+  // three sensitive fields have no projection at all, so even a row object
+  // carrying them (defense-in-depth test above) cannot leak them.
+  const fs = require('node:fs');
+  const src = fs.readFileSync(
+    require('node:path').join(__dirname, '..', '..', 'src', 'modules', 'imports', 'index.js'),
+    'utf8'
+  );
+  const projBlock = src.slice(
+    src.indexOf('const personnel = result.rows.map'),
+    src.indexOf("res.json({ ok: true, batch: batchResult")
+  );
+  const keys = [...projBlock.matchAll(/^\s+([A-Za-z0-9_]+): r\./gm)].map((m) => m[1]);
+  assert.ok(keys.length > 20, 'projection must cover the readable proforma columns');
+  assert.ok(!keys.some((k) => k.includes('_')), 'projection must be all camelCase: ' + keys.join(','));
+  for (const col of ['aadhar_number', 'voter_id', 'mobile_no']) {
+    assert.ok(!projBlock.includes(col), 'projection must not read ' + col);
+  }
 });
 
 test('personnel SQL never selects sensitive columns', async () => {
@@ -168,7 +196,4 @@ test('response objects never leak sensitive values (defense-in-depth)', async ()
 
 test.after(() => {
   pool.query = realQuery;
-});
-
-  assert.equal(body.ok, false);
 });

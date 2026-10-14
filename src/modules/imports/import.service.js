@@ -14,6 +14,7 @@
 const pool = require('../../database');
 const { parseProformaWorkbook } = require('./excel.parser');
 const { validateRows } = require('./validation');
+const { resolveExemption } = require('./exemption.mapping');
 
 const IMPORT_DISTRICT = 'Kakinada';
 
@@ -34,8 +35,8 @@ const PERSONNEL_COLUMNS = [
 
 const INSERT_SQL = `
   INSERT INTO personnel (
-    import_batch_id, import_status, district, ${PERSONNEL_COLUMNS.join(', ')}
-  ) VALUES ($1, 'accepted', $2, ${PERSONNEL_COLUMNS.map((_, i) => `$${i + 3}`).join(', ')})
+    import_batch_id, import_status, district, exempt_category, ${PERSONNEL_COLUMNS.join(', ')}
+  ) VALUES ($1, 'accepted', $2, $3, ${PERSONNEL_COLUMNS.map((_, i) => `$${i + 4}`).join(', ')})
 `;
 
 /**
@@ -70,12 +71,23 @@ async function persistPersonnelImport({ fileName, buffer, importedBy }) {
     );
     const batchId = batchResult.rows[0].id;
 
+    const dept = sheetInfo.departmentName;
+    let exemptCount = 0;
     for (const record of accepted) {
+      // Circular p.61 exemption resolution (sheet Department + row Designation).
+      // Never blocks the import: markings land in exempt_category and Stage 1
+      // excludes them from the pool; the authority reviews them before running.
+      const hit = resolveExemption(dept, record.designation);
+      const exemptCategory = hit ? hit.category : null;
+      if (hit) exemptCount += 1;
       const values = PERSONNEL_COLUMNS.map((column) => record[column] ?? null);
-      await client.query(INSERT_SQL, [batchId, IMPORT_DISTRICT, ...values]);
+      await client.query(INSERT_SQL, [batchId, IMPORT_DISTRICT, exemptCategory, ...values]);
     }
 
-    await client.query(`UPDATE import_batches SET status = 'completed' WHERE id = $1`, [batchId]);
+    await client.query(
+      `UPDATE import_batches SET status = 'completed' WHERE id = $1`,
+      [batchId]
+    );
     await client.query('COMMIT');
 
     return {
@@ -83,6 +95,7 @@ async function persistPersonnelImport({ fileName, buffer, importedBy }) {
       totalRows: accepted.length + rejected.length,
       acceptedRows: accepted.length,
       rejectedRows: rejected.length,
+      exemptRows: exemptCount,
       rejected,
     };
   } catch (err) {

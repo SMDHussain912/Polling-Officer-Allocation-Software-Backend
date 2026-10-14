@@ -63,6 +63,7 @@ const PER_POLLING_STATION = Object.freeze({
 /** [O] Exempted categories (circular p.4, "Exempted"). */
 const EXEMPT_CATEGORY = Object.freeze({
   VETERINARY: 'veterinary_staff', // Doctors and Compounders of veterinary hospitals
+  HEALTH_MEDICAL: 'health_medical', // Doctors of Health Department (circular p.61 (a)(ii))
   NURSE_ANM: 'nurse_anm', // Nurses, ANMs of Health Department
   AYUSH: 'ayush_medical', // Unani & Medical Officers of Ayush Department
   AIR: 'all_india_radio', // Staff of All India Radio
