@@ -36,6 +36,14 @@ const express = require('express');
 const pool = require('../../database');
 const { requireAuth, authorize } = require('../../middleware/auth');
 const { persistPersonnelImport, patchPersonnelExemption } = require('./import.service');
+const {
+  replaceMicroObservers,
+  replaceTrainingLocations,
+  replaceRequirements,
+  createTrainingBatches,
+  clearTrainingBatches,
+} = require('./intake.service');
+const { IntakeParseError } = require('./intake');
 const { ImportParseError } = require('./excel.parser');
 
 const MAX_FILE_BYTES = 15 * 1024 * 1024; // decoded size cap (~15 MB)
@@ -253,6 +261,166 @@ router.patch(
         : err.message === 'note must be a string up to 400 characters' ? 400
         : 400;
       res.status(status).json({ ok: false, error: err.message });
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Read endpoints for the Phase-1 intake lists (frontend tables + edit screens).
+// ---------------------------------------------------------------------------
+router.get('/micro-observers', authorize('staff', 'authority', 'admin'), async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM micro_observers ORDER BY id LIMIT 5000'
+    );
+    res.json({ ok: true, count: rows.length, microObservers: rows });
+  } catch (err) {
+    console.error('list micro observers failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load micro observers' });
+  }
+});
+
+router.get('/training-locations', authorize('staff', 'authority', 'admin'), async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM training_locations ORDER BY mandal, location_name LIMIT 5000'
+    );
+    res.json({ ok: true, count: rows.length, locations: rows });
+  } catch (err) {
+    console.error('list training locations failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load training locations' });
+  }
+});
+
+router.get('/requirements', authorize('staff', 'authority', 'admin'), async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM election_requirements ORDER BY mandal LIMIT 500'
+    );
+    res.json({ ok: true, count: rows.length, requirements: rows });
+  } catch (err) {
+    console.error('list requirements failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load requirements' });
+  }
+});
+
+// Batches with members (officer details + location + env date/time shown by
+// the frontend Training page). Join keeps the response one query.
+router.get('/training-batches', authorize('staff', 'authority', 'admin'), async (_req, res) => {
+  try {
+    const batchesRes = await pool.query(
+      `SELECT b.id, b.batch_no, b.mandal, b.location_id,
+              l.location_name, l.panchayat, l.category
+         FROM training_batches b
+         LEFT JOIN training_locations l ON l.id = b.location_id
+        ORDER BY b.mandal, b.batch_no`
+    );
+    const membersRes = await pool.query(
+      `SELECT m.batch_id, m.personnel_id, m.added_by_code,
+              p.employee_id, p.employee_name, p.designation, p.mobile_no,
+              p.email, p.work_mandal
+         FROM training_batch_members m
+         JOIN personnel p ON p.id = m.personnel_id
+        ORDER BY p.employee_name`
+    );
+    const byBatch = new Map();
+    for (const m of membersRes.rows) {
+      if (!byBatch.has(m.batch_id)) byBatch.set(m.batch_id, []);
+      byBatch.get(m.batch_id).push(m);
+    }
+    const batches = batchesRes.rows.map((b) => ({
+      ...b,
+      members: byBatch.get(b.id) || [],
+    }));
+    res.json({ ok: true, count: batches.length, batches });
+  } catch (err) {
+    console.error('list training batches failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load training batches' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Phase-1 intake hub: Micro Observers / training locations / requirements.
+// Same upload format as personnel: { fileName, dataBase64 }.
+// Upload REPLACES the whole table (corrected file supersedes old one);
+// rejected rows returned with reasons (not stored for these lists).
+// ---------------------------------------------------------------------------
+async function handleIntake(req, res, fn) {
+  const { fileName, dataBase64 } = req.body || {};
+  if (!fileName || typeof fileName !== 'string') {
+    return res.status(400).json({ ok: false, error: 'fileName is required' });
+  }
+  if (!dataBase64 || typeof dataBase64 !== 'string') {
+    return res.status(400).json({ ok: false, error: 'dataBase64 is required' });
+  }
+  const buffer = Buffer.from(dataBase64, 'base64');
+  if (buffer.length === 0) {
+    return res.status(400).json({ ok: false, error: 'Uploaded file is empty' });
+  }
+  if (buffer.length > MAX_FILE_BYTES) {
+    return res.status(413).json({ ok: false, error: 'File too large (max 15 MB)' });
+  }
+  try {
+    const result = await fn(buffer);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    if (err instanceof IntakeParseError) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+    if (err && err.statusCode === 409) {
+      return res.status(409).json({ ok: false, error: err.message });
+    }
+    console.error('intake import failed:', err);
+    res.status(500).json({ ok: false, error: 'Import failed' });
+  }
+}
+
+router.post(
+  '/micro-observers',
+  authorize('authority', 'admin'),
+  (req, res) => handleIntake(req, res, (buffer) => replaceMicroObservers({ buffer }))
+);
+
+router.post(
+  '/training-locations',
+  authorize('authority', 'admin'),
+  (req, res) => handleIntake(req, res, (buffer) => replaceTrainingLocations({ buffer }))
+);
+
+router.post(
+  '/requirements',
+  authorize('authority', 'admin'),
+  (req, res) => handleIntake(req, res, (buffer) => replaceRequirements({ buffer }))
+);
+
+// Training batches: create (code, random within mandal, <=100) / clear.
+router.post(
+  '/training-batches/create',
+  authorize('authority', 'admin'),
+  async (req, res) => {
+    try {
+      const result = await createTrainingBatches({ createdBy: req.session.user.id });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      if (err && err.statusCode === 409) {
+        return res.status(409).json({ ok: false, error: err.message });
+      }
+      console.error('create training batches failed:', err);
+      res.status(500).json({ ok: false, error: 'Batch creation failed' });
+    }
+  }
+);
+
+router.delete(
+  '/training-batches',
+  authorize('authority', 'admin'),
+  async (_req, res) => {
+    try {
+      const result = await clearTrainingBatches();
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      console.error('clear training batches failed:', err);
+      res.status(500).json({ ok: false, error: 'Clear failed' });
     }
   }
 );

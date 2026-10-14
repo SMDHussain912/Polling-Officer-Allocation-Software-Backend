@@ -12,4 +12,16 @@ module.exports = {
   databaseUrl: process.env.DATABASE_URL,
   sessionSecret: process.env.SESSION_SECRET,
   port: Number(process.env.PORT) || 3000,
+  // Dates/times that change between elections (team decision: keep in .env,
+  // not DB — edit + restart to change). Frontend shows them read-only.
+  training: {
+    date: process.env.TRAINING_DATE || '',
+    timeFrom: process.env.TRAINING_TIME_FROM || '',
+    timeTo: process.env.TRAINING_TIME_TO || '',
+  },
+  orders: {
+    pollingDateTime: process.env.POLLING_DATE_TIME || '',
+    distributionCenter: process.env.DISTRIBUTION_CENTER || '',
+    distributionReportTime: process.env.DISTRIBUTION_REPORT_TIME || '',
+  },
 };
