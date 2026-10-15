@@ -159,13 +159,21 @@ router.post('/run', async (req, res) => {
 
     // Write-through to the DB; awaited so a restart immediately after the
     // response still finds this run (fixes "stages didn't save").
-    await recordRun({
+    const saved = await recordRun({
       runAt: new Date().toISOString(),
       runBy: { id: req.session.user.id, username: req.session.user.username, role: req.session.user.role },
       ...result,
     });
 
-    res.json({ ok: true, ...result });
+    res.json({
+      ok: true,
+      ...result,
+      runId: saved.id || null,
+      // Honest save status: stageTablesError set => normalized Stage 2/3
+      // rows did NOT persist (loud failure, never silent).
+      stageTables: saved.stageTables || null,
+      stageTablesError: saved.stageTablesError || null,
+    });
   } catch (err) {
     const status = err && err.statusCode ? err.statusCode : 500;
     const message =

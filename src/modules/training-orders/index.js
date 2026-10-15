@@ -1,166 +1,239 @@
 'use strict';
 
-/** Training order allocation + print (DOCX) logic.
+/**
+ * Training orders — PO / APO allocation + per-officer DOCX print + ZIP download.
  *
- *  1) Allocation auto-creates PO/APO batches from the last completed run's
- *     team (allocation-store). Designation-based:
- *       - PO      = presidingEligible === true
- *       - APO     = all other officers (remaining from the team)
- *     MO invitees are NOT included. Batches are formed per mandal from the
- *     officer's duty-allocated mandal (stage-3), no cross-mandal mixing.
- *  2) Print uploads the PO or APO DOCX template, merges {{tags}} via the
- *     proven order-merge engine (docxtemplater + pizzip) with order-level +
- *     batch-level values, and stores the generated DOCX + the order record
- *     in the training_orders table (migration 011).
- *
- * Run: node --test tests/training-orders/index.test.js
+ * Spec: TRAINING-ORDERS-ANALYSIS.md
+ *  - Separate tables: po_* / apo_*
+ *  - Allocate from last Stage-2 excelRows (duty/posting mandal); skip MO
+ *  - Re-allocate = wipe all six tables then refill
+ *  - Print = built-in tagged templates, one DOCX per officer, auto SL
+ *  - Download = ZIP of generated orders
+ *  - Config from .env via src/config
  */
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const XLSX = require('xlsx');
+const PizZip = require('pizzip');
 const pool = require('../../database');
-const { getLastRun, hydrateOnce } = require('../randomization/allocation-store');
+const config = require('../../config');
+const { getLastRun, hydrateOnce, latestStageTables } = require('../randomization/allocation-store');
 const { mergeDocx } = require('../imports/order-merge.service');
 
 const MAX_BATCH_SIZE = 100;
 
-/**
- * Normalize header cell -> lowercase, no spaces/punctuation.
- */
-function normalizeHeader(cell) {
-  return String(cell ?? '')
-    .replace(/[\\r\\n]+/g, ' ')
-    .replace(/[^\\w+#]/g, '')
-    .toLowerCase();
-}
+const TABLES = Object.freeze({
+  PO: {
+    batches: 'po_training_batches',
+    members: 'po_training_batch_members',
+    orders: 'po_training_orders',
+    template: path.join(__dirname, '../../../docs/po-order-tagged.docx'),
+  },
+  APO: {
+    batches: 'apo_training_batches',
+    members: 'apo_training_batch_members',
+    orders: 'apo_training_orders',
+    template: path.join(__dirname, '../../../docs/apo-order-tagged.docx'),
+  },
+});
 
-/** Read first sheet as array-of-arrays. */
-function readGrid(buffer) {
-  let workbook;
-  try {
-    workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true, raw: false });
-  } catch (err) {
-    throw new Error('File could not be read as an Excel workbook.');
+function tablesFor(group) {
+  const g = String(group || '').toUpperCase();
+  if (g !== 'PO' && g !== 'APO') {
+    const err = new Error('group must be PO or APO');
+    err.statusCode = 400;
+    throw err;
   }
-  const sheetName = workbook.SheetNames[0];
-  if (!sheetName) throw new Error('Workbook has no sheets.');
-  return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
-    header: 1,
-    raw: true,
-    defval: '',
-    blankrows: false,
-  });
+  return TABLES[g];
 }
 
-function mapHeader(grid, candidates) {
-  for (let i = 0; i < grid.length; i += 1) {
-    const row = grid[i] || [];
-    const colMap = {};
-    row.forEach((cell, col) => {
-      const h = normalizeHeader(cell);
-      if (!h) return;
-      for (const [field, aliases] of Object.entries(candidates)) {
-        if (colMap[field] !== undefined) continue;
-        if (aliases.some((a) => h === a || h.includes(a))) colMap[field] = col;
-      }
-    });
-    if (Object.keys(colMap).length > 0) return { colMap, headerRow: i };
+/** Classify Stage-2 role → PO | APO | MO (skip). */
+function classifyRole(role) {
+  const r = String(role || '').toLowerCase();
+  if (r.includes('micro') && r.includes('observer')) return 'MO';
+  if (r === 'mo' || r.startsWith('micro observer')) return 'MO';
+  if (r.includes('presid')) return 'PO';
+  return 'APO';
+}
+
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = crypto.randomInt(i + 1);
+    const t = arr[i];
+    arr[i] = arr[j];
+    arr[j] = t;
   }
-  throw new Error('Header row not found.');
+  return arr;
 }
 
-function normalizeCell(value) {
-  if (value === null || value === undefined) return '';
-  if (value instanceof Date) return value.toISOString();
-  return String(value).replace(/[\\r\\n]+/g, ' ').replace(/\\s+/g, ' ').trim();
-}
-
-/**
- * Parse the uploaded training file (venues + schedule + date/time per group).
- * Required columns: group (PO/APO), mandal, venue, date_time (schedule).
- * Extra columns tolerated (employee_name, employee_id, location, notes).
- */
-function parseTrainingData(buffer) {
-  const grid = readGrid(buffer);
-  const { colMap, headerRow } = mapHeader(grid, {
-    group: ['group', 'poapo', 'type'],
-    mandal: ['mandal'],
-    venue: ['venue', 'location', 'locationname', 'venuename'],
-    date_time: ['datetime', 'date', 'dateandtime', 'scheduling'],
-    employee_name: ['employeename', 'name', 'employee'],
-    employee_id: ['employeeid', 'empid', 'id'],
-    location: ['location'],
-    notes: ['notes', 'remarks'],
-  });
-  const accepted = [];
-  const rejected = [];
-  const seen = new Set();
-  for (let i = headerRow + 1; i < grid.length; i += 1) {
-    const row = grid[i] || [];
-    const get = (f) => (colMap[f] !== undefined ? normalizeCell(row[colMap[f]]) : '');
-    const group = get('group') || '';
-    const mandal = get('mandal') || '';
-    const venue = get('venue') || '';
-    const dateTime = get('date_time') || '';
-    if (!group && !mandal && !venue && !dateTime) continue;
-    const reasons = [];
-    if (!group) reasons.push('group_required');
-    if (!mandal) reasons.push('mandal_required');
-    if (!venue) reasons.push('venue_required');
-    if (!dateTime) reasons.push('date_time_required');
-    const key = (group + '|' + mandal + '|' + venue + '|' + dateTime).toLowerCase();
-    if (!reasons.length) {
-      if (seen.has(key)) reasons.push('duplicate_row_in_file');
-      else seen.add(key);
+/** Parse TRAINING_DATE (dd.mm.yyyy or yyyy-mm-dd) → { dd, mm, yyyy, weekday }. */
+function parseTrainingDate(raw) {
+  const s = String(raw || '').trim();
+  let d = null;
+  let m = null;
+  let y = null;
+  const dmy = s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
+  const ymd = s.match(/^(\d{4})[./-](\d{1,2})[./-](\d{1,2})$/);
+  if (dmy) {
+    d = dmy[1].padStart(2, '0');
+    m = dmy[2].padStart(2, '0');
+    y = dmy[3];
+  } else if (ymd) {
+    y = ymd[1];
+    m = ymd[2].padStart(2, '0');
+    d = ymd[3].padStart(2, '0');
+  }
+  let weekday = '';
+  if (d && m && y) {
+    const dt = new Date(Number(y), Number(m) - 1, Number(d));
+    if (!Number.isNaN(dt.getTime())) {
+      weekday = dt.toLocaleDateString('en-IN', { weekday: 'long' });
     }
-    accepted.push({
-      group,
-      mandal,
-      venue,
-      date_time: dateTime,
-      employee_name: get('employee_name') || null,
-      employee_id: get('employee_id') || null,
-      location: get('location') || null,
-      notes: get('notes') || null,
-      raw_sheet_row: i + 1,
-    });
-    if (reasons.length) rejected.push({ sheetRow: i + 1, group, mandal, reasons });
   }
-  return { accepted, rejected };
+  return { dd: d || '', mm: m || '', yyyy: y || '', weekday };
+}
+
+function envMergeDefaults() {
+  const training = config.training || {};
+  const orders = config.orders || {};
+  const parsed = parseTrainingDate(training.date);
+  const year =
+    config.electionYear ||
+    parsed.yyyy ||
+    String(new Date().getFullYear());
+  const district = config.districtName || 'Kakinada';
+  return {
+    district,
+    order_date: config.orderDate || orders.pollingDateTime || '',
+    order_place: config.orderPlace || district,
+    election_year: year,
+    training_dd: parsed.dd,
+    training_mm: parsed.mm,
+    training_yyyy: parsed.yyyy,
+    training_weekday: parsed.weekday,
+    training_time_from: training.timeFrom || '',
+    training_time_to: training.timeTo || '',
+  };
 }
 
 /**
- * Allocate training batches from the LAST COMPLETED RUN's team rows.
- * Reads stage2.excelRows (flattened: {teamCode, mandal, role, employeeId,
- * name, designation, office}); PO = presiding role, APO = every other role.
- * Returns { batches, errors } — never throws (frontend decides what to do).
+ * Wipe all PO + APO training batch/member/order rows (cascade members via FK).
+ */
+async function wipeAllTraining(client) {
+  await client.query('DELETE FROM po_training_orders');
+  await client.query('DELETE FROM apo_training_orders');
+  await client.query('DELETE FROM po_training_batch_members');
+  await client.query('DELETE FROM apo_training_batch_members');
+  await client.query('DELETE FROM po_training_batches');
+  await client.query('DELETE FROM apo_training_batches');
+}
+
+/**
+ * Resolve HR employee_id strings → personnel.id (+ profile fields).
+ * Returns Map employee_id -> { id, employee_id, employee_name, ... }.
+ */
+async function loadPersonnelByEmployeeIds(client, employeeIds) {
+  const ids = [...new Set(employeeIds.map((x) => String(x).trim()).filter(Boolean))];
+  const map = new Map();
+  if (ids.length === 0) return map;
+  const r = await client.query(
+    `SELECT p.id, p.employee_id, p.employee_name, p.designation, p.mobile_no,
+            p.work_mandal, p.residence_address, b.department_name
+       FROM personnel p
+       LEFT JOIN import_batches b ON b.id = p.import_batch_id
+      WHERE p.employee_id = ANY($1::text[])`,
+    [ids]
+  );
+  for (const row of r.rows) {
+    map.set(String(row.employee_id).trim(), row);
+  }
+  return map;
+}
+
+/**
+ * Allocate: wipe → split Stage-2 rows into PO/APO by duty mandal → batches ≤100.
  */
 async function allocateTraining({ createdBy } = {}) {
-  await hydrateOnce(); // cold start (restart) -> reload latest run from the DB
-  const lastRun = getLastRun();
-  const teamRows = lastRun && lastRun.stage2 && Array.isArray(lastRun.stage2.excelRows)
-    ? lastRun.stage2.excelRows
-    : [];
+  await hydrateOnce();
+
+  // Source priority: normalized Stage 2/3 DB tables (migration 014) first —
+  // they carry the stored training_group + duty mandal per officer and prove
+  // Stage 2/3 actually persisted. Fall back to last-run JSON only when the
+  // run predates migration 014.
+  let teamRows = [];
+  let source = 'none';
+  let stageRunId = null;
+  try {
+    const tables = await latestStageTables();
+    if (tables && tables.rows.length > 0) {
+      stageRunId = tables.runId;
+      source = 'stage_tables';
+      teamRows = tables.rows.map((r) => ({
+        teamCode: r.team_code,
+        mandal: r.mandal,
+        role: r.role,
+        duty: r.duty,
+        employeeId: r.employee_id,
+        trainingGroup: r.training_group,
+      }));
+    }
+  } catch (err) {
+    // Table read failed (e.g. migration not applied) — fall through to JSON.
+    if (process.env.NODE_ENV !== 'test') {
+      console.warn('allocateTraining: stage tables unreadable, trying run JSON (' + (err.message || err) + ')');
+    }
+  }
   if (teamRows.length === 0) {
-    return { batches: [], errors: ['No completed randomization run found. Run Stage 2 first.'] };
+    const lastRun = getLastRun();
+    const jsonRows =
+      lastRun && lastRun.stage2 && Array.isArray(lastRun.stage2.excelRows)
+        ? lastRun.stage2.excelRows
+        : [];
+    if (jsonRows.length > 0) {
+      source = 'run_json';
+      teamRows = jsonRows;
+    }
+  }
+  if (teamRows.length === 0) {
+    return {
+      batches: [],
+      errors: ['No completed randomization run found. Run Stage 2/3 first (POST /api/randomization/run).'],
+      skippedMo: 0,
+      unresolved: 0,
+      source,
+      stageRunId,
+    };
   }
 
+  const groups = { PO: [], APO: [] };
+  let skippedMo = 0;
+  for (const row of teamRows) {
+    // DB-table rows carry the stored training_group (classified at run time);
+    // run-JSON rows are classified live. Both skip MO.
+    const kind = row.trainingGroup === 'PO' || row.trainingGroup === 'APO'
+      ? row.trainingGroup
+      : row.trainingGroup === 'MO'
+        ? 'MO'
+        : classifyRole(row.role);
+    if (kind === 'MO') {
+      skippedMo += 1;
+      continue;
+    }
+    groups[kind].push(row);
+  }
+
+  const allEmpIds = [...groups.PO, ...groups.APO].map((r) => r.employeeId);
   const client = await pool.connect();
   const batches = [];
+  let unresolved = 0;
   try {
     await client.query('BEGIN');
+    await wipeAllTraining(client);
+    const personnelMap = await loadPersonnelByEmployeeIds(client, allEmpIds);
 
-    // PO = presiding role; APO = every other officer role.
-    const isPO = (row) => String(row.role || '').toLowerCase().includes('presid');
-    const groups = { PO: [], APO: [] };
-    for (const row of teamRows) {
-      groups[isPO(row) ? 'PO' : 'APO'].push(row);
-    }
-
-    // Form batches per group per mandal (duty-allocated), <= MAX_BATCH_SIZE.
     for (const group of ['PO', 'APO']) {
+      const t = TABLES[group];
       const members = groups[group];
       if (members.length === 0) continue;
       const byMandal = new Map();
@@ -170,37 +243,45 @@ async function allocateTraining({ createdBy } = {}) {
         byMandal.get(mandal).push(m);
       }
       for (const [mandal, officers] of byMandal) {
-        const shuffled = officers.slice();
-        for (let i = shuffled.length - 1; i > 0; i -= 1) {
-          const j = crypto.randomInt(i + 1);
-          const t = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = t;
-        }
-        const existing = await client.query(
-          'SELECT COALESCE(MAX(batch_no), 0) AS max_no FROM training_batches WHERE mandal = $1',
-          [mandal]
-        );
-        let batchNo = Number(existing.rows[0].max_no) + 1;
+        const shuffled = shuffleInPlace(officers.slice());
+        let batchNo = 1;
         for (let start = 0; start < shuffled.length; start += MAX_BATCH_SIZE) {
           const chunk = shuffled.slice(start, start + MAX_BATCH_SIZE);
           const b = await client.query(
-            'INSERT INTO training_batches (batch_no, mandal, created_by) VALUES ($1, $2, $3) RETURNING id',
+            `INSERT INTO ${t.batches} (batch_no, mandal, created_by)
+             VALUES ($1, $2, $3) RETURNING id`,
             [batchNo, mandal, createdBy == null ? null : createdBy]
           );
           const batchId = b.rows[0].id;
+          let inserted = 0;
           for (const officer of chunk) {
-            const pid = Number(officer.employeeId);
-            if (!Number.isSafeInteger(pid)) continue;
+            const empKey = String(officer.employeeId || '').trim();
+            const per = personnelMap.get(empKey);
+            if (!per) {
+              unresolved += 1;
+              continue;
+            }
             await client.query(
-              'INSERT INTO training_batch_members (batch_id, personnel_id, added_by_code) VALUES ($1, $2, TRUE) ON CONFLICT DO NOTHING',
-              [batchId, pid]
+              `INSERT INTO ${t.members}
+                 (batch_id, personnel_id, employee_id, role, team_code, added_by_code)
+               VALUES ($1, $2, $3, $4, $5, TRUE)
+               ON CONFLICT DO NOTHING`,
+              [
+                batchId,
+                per.id,
+                per.employee_id,
+                officer.role || null,
+                officer.teamCode || null,
+              ]
             );
+            inserted += 1;
           }
           batches.push({
             id: batchId,
             batch_no: batchNo,
             mandal,
             group,
-            officer_count: chunk.length,
+            officer_count: inserted,
           });
           batchNo += 1;
         }
@@ -208,104 +289,131 @@ async function allocateTraining({ createdBy } = {}) {
     }
 
     await client.query('COMMIT');
-    return { batches, errors: [] };
+    return { batches, errors: [], skippedMo, unresolved, source, stageRunId };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    return { batches, errors: [err.message] };
+    return { batches, errors: [err.message], skippedMo, unresolved, source, stageRunId };
   } finally {
     client.release();
   }
 }
 
-/**
- * Fill a DOCX template from an order record.
- * Two template styles are supported (both fill order-level + batch-level
- * values; nothing is invented):
- *   - {{tags}} templates (preferred): merged via the proven order-merge
- *     engine (docxtemplater + pizzip); missing tags render blank.
- *   - legacy ___ templates (docs/po order.docx, docs/apo order.docx):
- *     sequential ___ runs are replaced in document order with the ordered
- *     fill values (order_id, group, mandal, venue, date/time, counts...).
- * @param {Buffer} templateBytes  the uploaded DOCX
- * @param {Object} order          flat tag->value map (order_id,
- *   trainingGroup, batchNo, mandal, venue, date_time, scheduled_at,
- *   designated_officers, total_officers, prepared_by ...)
- * @returns {Promise<Buffer>} generated DOCX bytes
- */
-async function fillDocXPlaceholders(templateBytes, order) {
-  const data = order || {};
-  // Preferred path: {{tags}}. Only when the template actually contains one
-  // (the legacy ___ templates have none — docxtemplater would no-op).
-  const probe = Buffer.from(templateBytes).toString('utf8');
-  if (probe.includes('{{') || probe.includes('{order_') || probe.includes('{training_')) {
-    return mergeDocx(Buffer.from(templateBytes), data);
+/** List batches for PO or APO (with location name + member count). */
+async function listBatches(group) {
+  const t = tablesFor(group);
+  const r = await pool.query(
+    `SELECT b.id, b.batch_no, b.mandal, b.location_id, l.location_name,
+            (SELECT COUNT(*)::int FROM ${t.members} m WHERE m.batch_id = b.id) AS member_count,
+            b.created_at
+       FROM ${t.batches} b
+       LEFT JOIN training_locations l ON l.id = b.location_id
+      ORDER BY b.mandal, b.batch_no`
+  );
+  return { group: String(group).toUpperCase(), batches: r.rows };
+}
+
+/** List members of one batch. */
+async function listBatchMembers(group, batchId) {
+  const t = tablesFor(group);
+  const id = Number(batchId);
+  if (!Number.isSafeInteger(id)) {
+    const err = new Error('batchId must be a number');
+    err.statusCode = 400;
+    throw err;
   }
-  // Legacy path: sequential ___ runs -> ordered fill values.
-  const PizZipLocal = require('pizzip');
-  const ordered = [
-    data.order_id, data.trainingGroup, data.mandal, data.venue,
-    data.date_time, data.scheduled_at, data.designated_officers,
-    data.total_officers, data.batchNo, data.prepared_by,
-  ].map((v) => (v == null ? '' : String(v)));
-  const zip = new PizZipLocal(Buffer.from(templateBytes));
-  const name = 'word/document.xml';
-  const file = zip.files[name];
-  if (!file) throw new Error('Not a valid DOCX (missing word/document.xml).');
-  let xml = file.asText();
-  let i = 0;
-  xml = xml.replace(/_{2,}/g, (run) => {
-    // Keep long decorative rules (e.g. 40+ underscores) untouched; only
-    // fill short placeholder runs.
-    if (run.length > 20 || i >= ordered.length) return run;
-    const val = ordered[i++];
-    if (!val) return run;
-    return val;
-  });
-  zip.file(name, xml);
-  return zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
+  const b = await pool.query(`SELECT id, batch_no, mandal, location_id FROM ${t.batches} WHERE id = $1`, [id]);
+  if (b.rows.length === 0) {
+    const err = new Error('Batch not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  const m = await pool.query(
+    `SELECT m.personnel_id, m.employee_id, m.role, m.team_code,
+            p.employee_name, p.designation, p.native_mandal, p.work_mandal, p.mobile_no,
+            -- Stage 3 allotment: officer's real duty station + mandal (join via
+            -- team_code on the latest run that mapped this team).
+            a.station_code AS venue_code, a.station_mandal AS duty_mandal
+       FROM ${t.members} m
+       JOIN personnel p ON p.id = m.personnel_id
+       LEFT JOIN LATERAL (
+         SELECT sa.station_code, sa.station_mandal
+           FROM stage3_assignments sa
+          WHERE sa.team_code = m.team_code
+          ORDER BY sa.run_id DESC
+          LIMIT 1
+       ) a ON TRUE
+      WHERE m.batch_id = $1
+      ORDER BY p.employee_name`,
+    [id]
+  );
+  return { group: String(group).toUpperCase(), batch: b.rows[0], members: m.rows };
 }
 
-/**
- * Build a training order DOCX from a template + order payload.
- * Returns { buffer: Buffer }.
- */
-async function buildTrainingOrderDocx(templateBytes, order) {
-  return fillDocXPlaceholders(templateBytes, order);
+/** Same-mandal locations for a batch. */
+async function listBatchLocations(group, batchId) {
+  const t = tablesFor(group);
+  const id = Number(batchId);
+  const b = await pool.query(`SELECT id, mandal FROM ${t.batches} WHERE id = $1`, [id]);
+  if (b.rows.length === 0) {
+    const err = new Error('Batch not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  const mandal = b.rows[0].mandal;
+  const locs = await pool.query(
+    `SELECT id, location_name, panchayat, mandal, category
+       FROM training_locations
+      WHERE LOWER(TRIM(mandal)) = LOWER(TRIM($1))
+      ORDER BY location_name`,
+    [mandal]
+  );
+  return { locations: locs.rows, mandal };
 }
 
-/**
- * Create a training order record + store the generated DOCX bytes.
- */
-async function createTrainingOrder(input) {
+/** Assign / clear location (same-mandal guard). */
+async function assignBatchLocation(group, batchId, locationId) {
+  const t = tablesFor(group);
+  const id = Number(batchId);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const now = new Date().toISOString();
-    const r = await client.query(
-      `INSERT INTO training_orders (
-         order_id, training_group, batch_id, mandal, venue, date_time,
-         scheduled_at, designated_officers, total_officers, status,
-         order_pdf, order_docx, created_by, created_at, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'generated',$10,$11,$12,$13,$13)
-       RETURNING *`,
-      [
-        input.orderId,
-        input.trainingGroup,
-        input.batchId,
-        input.mandal,
-        input.venue,
-        input.dateTime,
-        input.scheduledAt,
-        input.designatedOfficers,
-        input.totalOfficers,
-        input.orderPdfBuffer,
-        input.orderDocxBuffer,
-        input.createdBy,
-        now,
-      ]
+    const b = await client.query(
+      `SELECT id, mandal FROM ${t.batches} WHERE id = $1 FOR UPDATE`,
+      [id]
     );
+    if (b.rows.length === 0) {
+      const err = new Error('Batch not found');
+      err.statusCode = 404;
+      throw err;
+    }
+    let locId = locationId == null || locationId === '' ? null : Number(locationId);
+    if (locId !== null) {
+      if (!Number.isSafeInteger(locId)) {
+        const err = new Error('locationId must be a number or null');
+        err.statusCode = 400;
+        throw err;
+      }
+      const loc = await client.query(
+        `SELECT id, mandal FROM training_locations WHERE id = $1`,
+        [locId]
+      );
+      if (loc.rows.length === 0) {
+        const err = new Error('Location not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      if (
+        String(loc.rows[0].mandal || '').trim().toLowerCase() !==
+        String(b.rows[0].mandal || '').trim().toLowerCase()
+      ) {
+        const err = new Error('Location mandal must match batch duty mandal');
+        err.statusCode = 400;
+        throw err;
+      }
+    }
+    await client.query(`UPDATE ${t.batches} SET location_id = $1 WHERE id = $2`, [locId, id]);
     await client.query('COMMIT');
-    return { order: r.rows[0] };
+    return { ok: true, batchId: id, locationId: locId };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
@@ -314,49 +422,192 @@ async function createTrainingOrder(input) {
   }
 }
 
-/**
- * List training orders (pagination + filters).
- */
-async function listTrainingOrders(params = {}) {
-  const { page = 1, perPage = 25, group, status } = params;
-  const offset = (page - 1) * perPage;
-  const where = [];
-  const values = [];
-  if (group) {
-    where.push(`training_group = $${values.length + 1}`);
-    values.push(group);
-  }
-  if (status) {
-    where.push(`status = $${values.length + 1}`);
-    values.push(status);
-  }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const countRes = await pool.query(
-    `SELECT COUNT(*) FROM training_orders ${whereSql}`,
-    values
-  );
-  const total = Number(countRes.rows[0].count);
-  const rows = await pool.query(
-    `SELECT id, order_id, training_group, batch_id, mandal, venue, date_time,
-            scheduled_at, designated_officers, total_officers, status,
-            order_pdf, order_docx, created_by, created_at, updated_at
-       FROM training_orders ${whereSql}
-       ORDER BY id DESC
-       LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
-    [...values, perPage, offset]
-  );
-  return { orders: rows.rows, page, perPage, total, totalPages: Math.ceil(total / perPage) };
+function officeAddressFor(per) {
+  const dept = (per.department_name && String(per.department_name).trim()) || '';
+  if (dept) return dept;
+  return '';
+}
+
+function designationDeptFor(per) {
+  const desig = (per.designation && String(per.designation).trim()) || '';
+  const dept = (per.department_name && String(per.department_name).trim()) || '';
+  if (desig && dept) return `${desig} / ${dept}`;
+  return desig || dept || '';
 }
 
 /**
- * Download a single order's DOCX (or PDF fallback) as an Attachment.
+ * Generate one DOCX per officer for PO or APO. Replaces prior orders for that group.
+ * Returns { generated, skippedNoLocation, errors }.
  */
-async function downloadTrainingOrder(id) {
+async function generateOrders({ group, createdBy } = {}) {
+  const t = tablesFor(group);
+  const g = String(group).toUpperCase();
+  if (!fs.existsSync(t.template)) {
+    const err = new Error(`Built-in template missing: ${path.basename(t.template)}`);
+    err.statusCode = 500;
+    throw err;
+  }
+  const templateBytes = fs.readFileSync(t.template);
+  const defaults = envMergeDefaults();
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Wipe prior generated orders for this group only (batches stay).
+    await client.query(`DELETE FROM ${t.orders}`);
+
+    const rows = await client.query(
+      `SELECT m.personnel_id, m.employee_id, m.role, m.team_code, m.batch_id,
+              b.mandal AS duty_mandal, b.batch_no,
+              l.location_name AS venue,
+              p.employee_name, p.designation, p.mobile_no, p.work_mandal,
+              ib.department_name
+         FROM ${t.members} m
+         JOIN ${t.batches} b ON b.id = m.batch_id
+         JOIN personnel p ON p.id = m.personnel_id
+         LEFT JOIN training_locations l ON l.id = b.location_id
+         LEFT JOIN import_batches ib ON ib.id = p.import_batch_id
+        ORDER BY b.mandal, b.batch_no, p.employee_name`
+    );
+
+    let sl = 0;
+    let generated = 0;
+    let skippedNoLocation = 0;
+    const errors = [];
+
+    for (const row of rows.rows) {
+      if (!row.venue) {
+        skippedNoLocation += 1;
+        // Still print with blank venue (fail-soft on venue) — user can assign later and re-generate.
+      }
+      sl += 1;
+      const per = {
+        department_name: row.department_name,
+        designation: row.designation,
+      };
+      const data = {
+        ...defaults,
+        sl_no: String(sl),
+        employee_id: row.employee_id || '',
+        employee_name: row.employee_name || '',
+        designation_dept: designationDeptFor(per),
+        office_address: officeAddressFor(per),
+        mobile_no: row.mobile_no || '',
+        training_venue: row.venue || '',
+        duty_mandal: row.duty_mandal || '',
+        ack_name: row.employee_name || '',
+        ack_designation: row.designation || '',
+        ack_mobile: row.mobile_no || '',
+        ack_work_mandal: row.work_mandal || '',
+      };
+      let docx;
+      try {
+        docx = mergeDocx(templateBytes, data);
+      } catch (e) {
+        errors.push(`personnel ${row.personnel_id}: ${e.message}`);
+        continue;
+      }
+      const orderId = `TR-${g}-${Date.now().toString(36).toUpperCase()}-${crypto.randomInt(100000, 999999)}-${sl}`;
+      await client.query(
+        `INSERT INTO ${t.orders}
+           (order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
+            mandal, venue, status, order_docx, created_by, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'generated',$9,$10,now(),now())`,
+        [
+          orderId,
+          sl,
+          row.batch_id,
+          row.personnel_id,
+          row.employee_id,
+          row.employee_name,
+          row.duty_mandal,
+          row.venue || null,
+          docx,
+          createdBy == null ? null : createdBy,
+        ]
+      );
+      generated += 1;
+    }
+
+    await client.query('COMMIT');
+    return { group: g, generated, skippedNoLocation, errors, totalMembers: rows.rows.length };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** List stored orders (optional group filter). */
+async function listTrainingOrders({ group, page = 1, perPage = 50 } = {}) {
+  const pageN = Math.max(1, Number(page) || 1);
+  const per = Math.min(200, Math.max(1, Number(perPage) || 50));
+  const offset = (pageN - 1) * per;
+
+  async function fromTable(g) {
+    const t = TABLES[g];
+    const count = await pool.query(`SELECT COUNT(*)::int AS c FROM ${t.orders}`);
+    const rows = await pool.query(
+      `SELECT id, order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
+              mandal, venue, status, created_at,
+              '${g}' AS training_group
+         FROM ${t.orders}
+        ORDER BY sl_no ASC, id ASC
+        LIMIT $1 OFFSET $2`,
+      [per, offset]
+    );
+    return { total: count.rows[0].c, orders: rows.rows };
+  }
+
+  if (group) {
+    const g = String(group).toUpperCase();
+    tablesFor(g);
+    const part = await fromTable(g);
+    return {
+      orders: part.orders,
+      page: pageN,
+      perPage: per,
+      total: part.total,
+      totalPages: Math.ceil(part.total / per) || 1,
+    };
+  }
+
+  // Both groups — single paginated UNION ALL so page > 1 actually pages through
+  // all PO + APO orders instead of re-fetching offset 0 on every page.
+  const countR = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM po_training_orders) +
+             (SELECT COUNT(*) FROM apo_training_orders) AS c`
+  );
+  const total = Number(countR.rows[0].c || 0);
+  const rows = await pool.query(
+    `SELECT id, order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
+            mandal, venue, status, created_at, 'PO' AS training_group
+       FROM po_training_orders
+     UNION ALL
+     SELECT id, order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
+            mandal, venue, status, created_at, 'APO' AS training_group
+       FROM apo_training_orders
+     ORDER BY sl_no ASC, id ASC
+     LIMIT $1 OFFSET $2`,
+    [per, offset]
+  );
+  return {
+    orders: rows.rows,
+    page: pageN,
+    perPage: per,
+    total,
+    totalPages: Math.ceil(total / per) || 1,
+  };
+}
+
+/** Single order download. */
+async function downloadTrainingOrder(group, id) {
+  const t = tablesFor(group);
   const r = await pool.query(
-    `SELECT order_id, training_group, batch_id, mandal, venue, date_time,
-            scheduled_at, designated_officers, total_officers, status,
-            order_pdf, order_docx, created_by, created_at, updated_at
-       FROM training_orders WHERE id = $1`, [id]
+    `SELECT id, order_id, employee_id, employee_name, order_docx
+       FROM ${t.orders} WHERE id = $1`,
+    [Number(id)]
   );
   if (r.rows.length === 0) {
     const err = new Error('Training order not found');
@@ -364,20 +615,74 @@ async function downloadTrainingOrder(id) {
     throw err;
   }
   const order = r.rows[0];
-  let buffer = order.order_docx;
-  const mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-  if (!buffer && order.order_pdf) {
-    buffer = order.order_pdf;
-    // infer from extension in filename if present
+  return {
+    order,
+    buffer: order.order_docx,
+    mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    filename: `${order.order_id || 'order'}.docx`,
+  };
+}
+
+/**
+ * ZIP all generated orders for group (PO|APO) or both when group omitted/ALL.
+ */
+async function buildOrdersZip(group) {
+  const zip = new PizZip();
+  let count = 0;
+
+  async function addGroup(g) {
+    const t = TABLES[g];
+    const r = await pool.query(
+      `SELECT order_id, employee_id, employee_name, order_docx, sl_no
+         FROM ${t.orders}
+        ORDER BY sl_no ASC, id ASC`
+    );
+    for (const row of r.rows) {
+      if (!row.order_docx) continue;
+      const safeName = String(row.employee_name || row.employee_id || 'officer')
+        .replace(/[^\w.\- ]+/g, '_')
+        .slice(0, 60);
+      const fname = `${g}/${String(row.sl_no).padStart(4, '0')}_${safeName}_${row.order_id}.docx`;
+      zip.file(fname, row.order_docx);
+      count += 1;
+    }
   }
-  return { order, buffer, mime };
+
+  const g = group ? String(group).toUpperCase() : 'ALL';
+  if (g === 'ALL') {
+    await addGroup('PO');
+    await addGroup('APO');
+  } else {
+    tablesFor(g);
+    await addGroup(g);
+  }
+
+  if (count === 0) {
+    const err = new Error('No generated orders to download. Run Print/Generate first.');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const buffer = zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
+  const filename =
+    g === 'ALL' ? 'training-orders-PO-APO.zip' : `training-orders-${g}.zip`;
+  return { buffer, filename, count };
 }
 
 module.exports = {
-  parseTrainingData,
+  MAX_BATCH_SIZE,
+  TABLES,
+  classifyRole,
+  parseTrainingDate,
+  envMergeDefaults,
   allocateTraining,
-  buildTrainingOrderDocx,
-  createTrainingOrder,
+  listBatches,
+  listBatchMembers,
+  listBatchLocations,
+  assignBatchLocation,
+  generateOrders,
   listTrainingOrders,
   downloadTrainingOrder,
+  buildOrdersZip,
+  wipeAllTraining,
 };

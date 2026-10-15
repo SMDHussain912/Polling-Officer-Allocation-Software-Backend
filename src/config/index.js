@@ -12,8 +12,8 @@ module.exports = {
   databaseUrl: process.env.DATABASE_URL,
   sessionSecret: process.env.SESSION_SECRET,
   port: Number(process.env.PORT) || 3000,
-  // Dates/times that change between elections (team decision: keep in .env,
-  // not DB — edit + restart to change). Frontend shows them read-only.
+  // Dates/times / letter metadata (team decision: .env wins for training orders).
+  // Edit + restart to change. See TRAINING-ORDERS-ANALYSIS.md.
   training: {
     date: process.env.TRAINING_DATE || '',
     timeFrom: process.env.TRAINING_TIME_FROM || '',
@@ -24,4 +24,8 @@ module.exports = {
     distributionCenter: process.env.DISTRIBUTION_CENTER || '',
     distributionReportTime: process.env.DISTRIBUTION_REPORT_TIME || '',
   },
+  districtName: process.env.DISTRICT_NAME || 'Kakinada',
+  orderDate: process.env.ORDER_DATE || '',
+  orderPlace: process.env.ORDER_PLACE || '',
+  electionYear: process.env.ELECTION_YEAR || '',
 };

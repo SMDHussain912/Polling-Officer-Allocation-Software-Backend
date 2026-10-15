@@ -250,9 +250,70 @@ function parseRequirements(buffer) {
   return { accepted, rejected };
 }
 
+/**
+ * parseTrainingSessions(buffer) -> { accepted, rejected }
+ * Training *sessions* schedule (title, session_type, mandal, venue, scheduled_at, ...).
+ * Required: district + title + session_type ('theory'|'practical').
+ * `id` / `created_at` are server defaults and are intentionally ignored if present.
+ */
+function parseTrainingSessions(buffer) {
+  const grid = readGrid(buffer);
+  const { colMap, headerRow } = mapHeader(grid, {
+    district: ['district'],
+    title: ['title'],
+    session_type: ['sessiontype', 'session_type', 'session type'],
+    mandal: ['mandalname', 'mandal'],
+    venue: ['venue'],
+    scheduled_at: ['scheduledat', 'scheduled_at', 'scheduled at'],
+    duration_minutes: ['durationminutes', 'duration_minutes', 'duration'],
+    conducted_by: ['conductedby', 'conducted_by', 'conducted by'],
+    status: ['status'],
+  });
+  const accepted = [];
+  const rejected = [];
+  const seen = new Set();
+  const asInt = (v) => {
+    const n = Number.parseInt(String(v).replace(/\.0+$/, ''), 10);
+    return Number.isSafeInteger(n) && n >= 0 ? n : null;
+  };
+  for (let i = headerRow + 1; i < grid.length; i += 1) {
+    const row = grid[i] || [];
+    const get = (f) => (colMap[f] !== undefined ? normalizeCell(row[colMap[f]]) : '');
+    const district = get('district');
+    const title = get('title');
+    const sessionType = get('session_type');
+    if (!district && !title && !sessionType) continue;
+    const reasons = [];
+    if (!district) reasons.push('district_required');
+    if (!title) reasons.push('title_required');
+    if (!sessionType) reasons.push('session_type_required');
+    else if (!['theory', 'practical'].includes(sessionType.toLowerCase())) reasons.push('session_type_invalid');
+    const key = (title + '|' + get('mandal') + '|' + get('venue')).toLowerCase();
+    if (!reasons.length) {
+      if (seen.has(key)) reasons.push('duplicate_session_in_file');
+      else seen.add(key);
+    }
+    const record = {
+      district,
+      title,
+      session_type: sessionType.toLowerCase(),
+      mandal: get('mandal') || null,
+      venue: get('venue') || null,
+      scheduled_at: get('scheduled_at') || null,
+      duration_minutes: asInt(get('duration_minutes')),
+      conducted_by: get('conducted_by') || null,
+      status: get('status') || 'planned',
+    };
+    if (reasons.length > 0) rejected.push({ sheetRow: i + 1, employeeId: null, reasons });
+    else accepted.push(record);
+  }
+  return { accepted, rejected };
+}
+
 module.exports = {
   IntakeParseError,
   parseMicroObservers,
   parseTrainingLocations,
+  parseTrainingSessions,
   parseRequirements,
 };

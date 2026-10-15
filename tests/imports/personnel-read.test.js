@@ -9,7 +9,7 @@
  *   - 400 on an invalid batch id
  *   - 404 on an unknown batch
  *   - 200 with the batch summary + personnel list
- *   - the personnel SQL never selects aadhar_number / voter_id / mobile_no
+ *   - the personnel SQL selects aadhar_number / mobile_no but never voter_id
  *
  * Run: node --test tests/imports/personnel-read.test.js
  */
@@ -59,7 +59,7 @@ async function request(app, method, path) {
   }
 }
 
-const SENSITIVE = ['aadhar_number', 'voter_id', 'mobile_no'];
+const SENSITIVE = ['voter_id'];
 
 test('unauthenticated request is rejected (401) and no query runs', async () => {
   capturedSql = [];
@@ -159,12 +159,15 @@ test('personnel rows are projected to a camelCase allow-list (no snake_case leak
   const keys = [...projBlock.matchAll(/^\s+([A-Za-z0-9_]+): r\./gm)].map((m) => m[1]);
   assert.ok(keys.length > 20, 'projection must cover the readable proforma columns');
   assert.ok(!keys.some((k) => k.includes('_')), 'projection must be all camelCase: ' + keys.join(','));
-  for (const col of ['aadhar_number', 'voter_id', 'mobile_no']) {
+  for (const col of ['voter_id']) {
     assert.ok(!projBlock.includes(col), 'projection must not read ' + col);
   }
+  // aadhar_number / mobile_no ARE projected for the Phase 1 frontend:
+  assert.ok(projBlock.includes('aadharNumber'), 'projection must read aadhar_number');
+  assert.ok(projBlock.includes('mobileNo'), 'projection must read mobile_no');
 });
 
-test('personnel SQL never selects sensitive columns', async () => {
+test('personnel SQL selects aadhar_number / mobile_no but never voter_id', async () => {
   capturedSql = [];
   handler = async (sql) => (/FROM import_batches/i.test(sql) ? { rows: [{ id: 7 }] } : { rows: [] });
   const app = buildApp({ withSession: true });
@@ -172,12 +175,14 @@ test('personnel SQL never selects sensitive columns', async () => {
 
   const personnelSql = capturedSql.find((s) => /FROM personnel/i.test(s));
   assert.ok(personnelSql, 'a personnel query must have run');
+  assert.ok(/aadhar_number/i.test(personnelSql), 'personnel query must select aadhar_number');
+  assert.ok(/mobile_no/i.test(personnelSql), 'personnel query must select mobile_no');
   for (const col of SENSITIVE) {
     assert.ok(!new RegExp(col, 'i').test(personnelSql), `personnel query must NOT select ${col}`);
   }
 });
 
-test('response objects never leak sensitive values (defense-in-depth)', async () => {
+test('response objects never leak voter_id; aadhar / mobile are returned', async () => {
   capturedSql = [];
   handler = async (sql) => {
     if (/FROM import_batches/i.test(sql)) return { rows: [{ id: 7 }] };
@@ -189,9 +194,9 @@ test('response objects never leak sensitive values (defense-in-depth)', async ()
   const app = buildApp({ withSession: true });
   const { body } = await request(app, 'GET', '/api/imports/batches/7/personnel');
   const serialized = JSON.stringify(body);
-  for (const secret of ['SECRET-AADHAAR', 'SECRET-EPIC', 'SECRET-MOBILE']) {
-    assert.ok(!serialized.includes(secret), `response leaked ${secret}`);
-  }
+  assert.ok(!serialized.includes('SECRET-EPIC'), 'response must not leak voter_id');
+  assert.ok(serialized.includes('SECRET-AADHAAR'), 'response must include aadhar_number');
+  assert.ok(serialized.includes('SECRET-MOBILE'), 'response must include mobile_no');
 });
 
 test.after(() => {

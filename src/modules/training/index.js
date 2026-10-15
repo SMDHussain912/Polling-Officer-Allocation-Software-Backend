@@ -226,98 +226,30 @@ router.delete(
 
 module.exports = router;
 // Separate PO/APO training orders (designation-based).
-// Filters by designation rules (presidingEligible => PO, all other officers
-// => APO) instead of the last-run team split, so orders stay deterministic.
-router.get('/batches/:id/orders', async (req, res) => {
-  try {
-    const id = Number.parseInt(req.params.id, 10);
-    if (!Number.isSafeInteger(id) || id <= 0) {
-      return res.status(400).json({ ok: false, error: 'Invalid batch id' });
-    }
-    const batch = await pool.query(
-      'SELECT id, batch_no, mandal, location_id, created_at FROM training_batches WHERE id = $1',
-      [id]
-    );
-    if (batch.rows.length === 0) {
-      return res.status(404).json({ ok: false, error: 'Batch not found' });
-    }
-    const group = req.query.group === 'PO' ? 'PO' : 'APO';
-    const members = await pool.query(
-      `SELECT p.id AS personnel_id, p.employee_id, p.employee_name, p.designation,
-              d.rules->>'presidingEligible' AS is_presiding_eligible,
-              COALESCE(a.alloted_mandal, p.work_mandal) AS duty_mandal
-         FROM personnel p
-         LEFT JOIN LATERAL (SELECT designation_rules AS rules FROM designation_rules
-                            WHERE designation = p.designation ORDER BY id LIMIT 1) d ON TRUE
-         LEFT JOIN LATERAL (
-           SELECT a.alloted_mandal FROM stage3_assignments a
-           WHERE a.personnel_id = p.personnel_id ORDER BY a.id DESC LIMIT 1
-         ) a ON TRUE
-        WHERE p.is_active = TRUE
-          AND p.district = 'Kakinada'
-          AND p.exempt_category IS NULL
-          AND (CASE WHEN $1 = 'PO' THEN (d.rules->>'presidingEligible')::boolean ELSE NOT (d.rules->>'presidingEligible')::boolean END)
-        ORDER BY p.employee_name`, [group]
-    );
-    res.json({ ok: true, batch: batch.rows[0], group, members: members.rows });
-  } catch (err) {
-    console.error('list training orders failed:', err);
-    res.status(500).json({ ok: false, error: 'Failed to load orders' });
-  }
+// NOTE: the two routes below are DISABLED — they queried tables that were
+// never created (designation_rules, stage3_assignments with a personnel_id
+// column) and returned 500 for every request. PO/APO orders are served by
+// the training-orders module (migration 013 tables + built-in DOCX
+// templates); see TRAINING-ORDERS-ANALYSIS.md. Kept as 410 Gone with a
+// pointer so old frontend builds fail loudly instead of silently.
+// PO/APO training orders live in the training-orders module (migration 013
+// tables + built-in DOCX templates); see TRAINING-ORDERS-ANALYSIS.md.
+// The two legacy routes below are disabled: they queried tables that were
+// never created (designation_rules, stage3_assignments with a personnel_id
+// column) and returned 500 for every request. They now answer 410 Gone so
+// old callers fail loudly instead of silently.
+router.get('/batches/:id/orders', (req, res) => {
+  res.status(410).json({
+    ok: false,
+    error: 'Gone: replaced by GET /api/imports/training-orders?group=PO|APO (migration 013 tables).',
+  });
 });
 
-router.post('/batches/:id/orders', authorize('authority', 'admin'), async (req, res) => {
-  try {
-    const id = Number.parseInt(req.params.id, 10);
-    if (!Number.isSafeInteger(id) || id <= 0) {
-      return res.status(400).json({ ok: false, error: 'Invalid batch id' });
-    }
-    const batch = await pool.query(
-      'SELECT id, batch_no, mandal, location_id, created_at FROM training_batches WHERE id = $1',
-      [id]
-    );
-    if (batch.rows.length === 0) {
-      return res.status(404).json({ ok: false, error: 'Batch not found' });
-    }
-    const group = req.body.group === 'PO' ? 'PO' : 'APO';
-    if (!group) {
-      return res.status(400).json({ ok: false, error: 'group (PO|APO) is required' });
-    }
-    const templates = await pool.query(
-      `SELECT id, kind, file FROM order_templates WHERE kind = $1 AND active ORDER BY id LIMIT 1`,
-      [group === 'PO' ? 'po_apo_training' : 'po_apo_training_gp']
-    );
-    if (templates.rows.length === 0) {
-      return res.status(400).json({ ok: false, error: 'No active template for group ' + group });
-    }
-    const orderRows = await pool.query(
-      `SELECT p.id AS personnel_id, p.employee_id, p.employee_name, p.designation,
-              d.rules->>'presidingEligible' AS is_presiding_eligible,
-              COALESCE(a.alloted_mandal, p.work_mandal) AS duty_mandal
-         FROM personnel p
-         LEFT JOIN LATERAL (SELECT designation_rules AS rules FROM designation_rules
-                            WHERE designation = p.designation ORDER BY id LIMIT 1) d ON TRUE
-         LEFT JOIN LATERAL (
-           SELECT a.alloted_mandal FROM stage3_assignments a
-           WHERE a.personnel_id = p.personnel_id ORDER BY a.id DESC LIMIT 1
-         ) a ON TRUE
-        WHERE p.is_active = TRUE
-          AND p.district = 'Kakinada'
-          AND p.exempt_category IS NULL
-          AND (CASE WHEN $1 = 'PO' THEN (d.rules->>'presidingEligible')::boolean ELSE NOT (d.rules->>'presidingEligible')::boolean END)
-        ORDER BY p.employee_name`, [group]
-    );
-    for (const o of orderRows.rows) {
-      await pool.query(
-        `INSERT INTO order_assignments (order_kind, personnel_id, role, created_by, created_at)
-         VALUES ($1, $2, $3, $4, now())`, [group === 'PO' ? 'po_apo_training' : 'po_apo_training_gp', o.personnel_id, group, req.session.user.id]
-      );
-    }
-    res.json({ ok: true, batch: batch.rows[0], group, created: orderRows.rows.length });
-  } catch (err) {
-    console.error('create training orders failed:', err);
-    res.status(500).json({ ok: false, error: 'Failed to create orders' });
-  }
+router.post('/batches/:id/orders', (req, res) => {
+  res.status(410).json({
+    ok: false,
+    error: 'Gone: replaced by POST /api/imports/training-orders/generate { group }.',
+  });
 });
 
 
