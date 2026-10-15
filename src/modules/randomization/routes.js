@@ -33,10 +33,17 @@ const express = require('express');
 const pool = require('../../database');
 const { requireAuth, authorize } = require('../../middleware/auth');
 const { runAllocation } = require('./orchestrator');
-const { recordRun, recordPublication, getLastRun } = require('./allocation-store');
+const { recordRun, recordPublication, hydrateOnce } = require('./allocation-store');
+const {
+  parseBallotRegister,
+  allocateBallots,
+  BallotParseError,
+} = require('./ballot-allocation');
 // Integration hook: register the AUTHORITY-SUPPLIED election configuration so
 // the standalone Stage 1 router can resolve it by id. Pure registration.
 const { registerElectionConfiguration } = require('../randomization-stage-1/wiring');
+
+const MAX_BALLOT_FILE_BYTES = 15 * 1024 * 1024; // decoded size cap (~15 MB)
 
 const router = express.Router();
 
@@ -122,6 +129,20 @@ router.post('/run', async (req, res) => {
     // standalone Stage 1 endpoints (registered as-is; nothing derived).
     registerElectionConfiguration(electionConfiguration);
 
+    // --- Separate MO upload (bank staff, POST /api/imports/micro-observers).
+    // Loaded on every run; when the table is empty the legacy officer-pool
+    // MO path applies. Never fails the run when the table is missing.
+    let moRows = null;
+    try {
+      const moResult = await pool.query(
+        'SELECT employee_id, employee_name, designation, bank_name, ' +
+        'working_mandal, native_mandal, residence_mandal FROM micro_observers LIMIT 5000'
+      );
+      moRows = moResult.rows;
+    } catch (err) {
+      moRows = null;
+    }
+
     // --- Execute the three-stage chain. ---------------------------------
     const result = await runAllocation({
       personnelRows: personnelResult.rows,
@@ -133,9 +154,12 @@ router.post('/run', async (req, res) => {
       districtId: districtId,
       actorId: req.session.user.id,
       seed: body.seed,
+      moRows: moRows,
     });
 
-    recordRun({
+    // Write-through to the DB; awaited so a restart immediately after the
+    // response still finds this run (fixes "stages didn't save").
+    await recordRun({
       runAt: new Date().toISOString(),
       runBy: { id: req.session.user.id, username: req.session.user.username, role: req.session.user.role },
       ...result,
@@ -150,6 +174,61 @@ router.post('/run', async (req, res) => {
         : (err && err.message) || 'Allocation failed';
     if (status >= 500) console.error('randomization run failed:', err);
     res.status(status).json({ ok: false, error: message });
+  }
+});
+
+// --- Phase 3: ballot register upload + officer allocation --------------------
+// Body (base64-JSON, same convention as /api/imports uploads so no multipart
+// package is needed): { fileName, dataBase64, presidingOfficers: [names],
+//                       pollingOfficers: [names] }
+// Officers come from Phase 2 (authority supplied, in rank order). Response
+// mirrors the frontend contract: { summary, rows } — one row per ballot.
+router.post('/ballot-allocation', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const { fileName, dataBase64 } = body;
+    if (!fileName || typeof fileName !== 'string') {
+      return res.status(400).json({ ok: false, error: 'fileName is required' });
+    }
+    if (!dataBase64 || typeof dataBase64 !== 'string') {
+      return res.status(400).json({ ok: false, error: 'dataBase64 is required' });
+    }
+    const buffer = Buffer.from(dataBase64, 'base64');
+    if (buffer.length === 0) {
+      return res.status(400).json({ ok: false, error: 'Uploaded file is empty' });
+    }
+    if (buffer.length > MAX_BALLOT_FILE_BYTES) {
+      return res.status(413).json({ ok: false, error: 'File too large (max 15 MB)' });
+    }
+    const presidingOfficers = Array.isArray(body.presidingOfficers) ? body.presidingOfficers : [];
+    const pollingOfficers = Array.isArray(body.pollingOfficers) ? body.pollingOfficers : [];
+    const parsed = parseBallotRegister(buffer);
+    if (parsed.accepted.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Ballot register has no usable rows (need Booth/Ballot ID or Booth/PS Number per row).',
+        rejected: parsed.rejected,
+      });
+    }
+    const result = allocateBallots({
+      ballots: parsed.accepted,
+      presidingOfficers: presidingOfficers,
+      pollingOfficers: pollingOfficers,
+    });
+    res.json({
+      ok: true,
+      fileName: fileName,
+      rejected: parsed.rejected,
+      summary: result.summary,
+      rows: result.rows,
+    });
+  } catch (err) {
+    if (err instanceof BallotParseError) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+    const status = err && err.statusCode ? err.statusCode : 500;
+    if (status >= 500) console.error('ballot allocation failed:', err);
+    res.status(status).json({ ok: false, error: (err && err.message) || 'Ballot allocation failed' });
   }
 });
 
@@ -168,7 +247,7 @@ router.post('/publish', async (req, res) => {
     const published = service.publish(stage3Run);
     const publishedAt = new Date().toISOString();
     const confirmedBy = { id: req.session.user.id, username: req.session.user.username, role: req.session.user.role };
-    recordPublication(published, confirmedBy);
+    await recordPublication(published, confirmedBy);
     res.json({
       ok: true,
       stage3: published,

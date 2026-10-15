@@ -18,6 +18,7 @@
  */
 
 const XLSX = require('xlsx');
+const { isMedicalDesignation } = require('./validation');
 
 class IntakeParseError extends Error {
   constructor(message) {
@@ -89,6 +90,10 @@ function toIso(value) {
 /**
  * parseMicroObservers(buffer) -> { accepted, rejected }
  * Required: employee_id + employee_name. Duplicates in file -> rejected.
+ * Medical / clinical designations are HARD-rejected (same authority decision
+ * 2026-10-15 as the personnel import): doctors, nurses/ANM, homeopaths,
+ * Ayurveda/Unani, compounders, pharmacists and related clinical roles must
+ * never enter the MO pool either.
  */
 function parseMicroObservers(buffer) {
   const grid = readGrid(buffer);
@@ -117,6 +122,9 @@ function parseMicroObservers(buffer) {
     const reasons = [];
     if (!employeeId) reasons.push('employee_id_required');
     if (!employeeName) reasons.push('employee_name_required');
+    // Same authority decision as the personnel import: medical / clinical
+    // designations must never enter the MO pool either.
+    if (isMedicalDesignation(get('designation'))) reasons.push('medical_designation_not_eligible');
     if (employeeId) {
       if (seen.has(employeeId)) reasons.push('duplicate_employee_id_in_file');
       else seen.add(employeeId);

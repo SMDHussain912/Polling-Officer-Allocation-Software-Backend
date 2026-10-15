@@ -29,7 +29,7 @@ const PERSONNEL_COLUMNS = [
   'voter_id', 'residence_address', 'residence_constituency_code',
   'residence_constituency_name', 'work_mandal', 'working_constituency_code',
   'working_constituency_name', 'native_mandal', 'native_constituency_code',
-  'native_constituency_name', 'previous_po_duty', 'mobile_no',
+  'native_constituency_name', 'previous_po_duty', 'mobile_no', 'email',
   'service_in_district_4y', 'ph_category', 'criminal_case_or_eci_orders',
   'exceeded_3_years', 'eci_ceo_order_details', 'remarks',
 ];

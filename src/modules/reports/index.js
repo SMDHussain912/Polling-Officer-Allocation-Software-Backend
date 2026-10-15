@@ -21,13 +21,14 @@
 const express = require('express');
 const pool = require('../../database');
 const { requireAuth, authorize } = require('../../middleware/auth');
-const { getLastRun, getPublication } = require('../randomization/allocation-store');
+const { getLastRun, getPublication, hydrateOnce } = require('../randomization/allocation-store');
 
 const router = express.Router();
 router.use(requireAuth);
 
 // --- Allocation report: last completed run + publication state ---------------
-router.get('/allocation', authorize('authority', 'admin'), (req, res) => {
+router.get('/allocation', authorize('authority', 'admin'), async (req, res) => {
+  await hydrateOnce(); // cold start (restart) -> reload latest run from the DB
   const last = getLastRun();
   if (!last) {
     return res.json({ ok: true, run: null, note: 'No allocation run yet in this session of the server.' });

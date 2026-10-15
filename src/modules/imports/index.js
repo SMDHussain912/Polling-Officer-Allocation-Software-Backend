@@ -51,6 +51,7 @@ const {
 } = require('./order-assignment.service');
 const { IntakeParseError } = require('./intake');
 const { ImportParseError } = require('./excel.parser');
+const trainingOrders = require('../training-orders/service');
 
 const MAX_FILE_BYTES = 15 * 1024 * 1024; // decoded size cap (~15 MB)
 
@@ -400,6 +401,44 @@ router.post(
 );
 
 // Training batches: create (code, random within mandal, <=100) / clear.
+router.post(
+  '/training-orders/allocate',
+  authorize('authority', 'admin'),
+  (req, res) => trainingOrders.allocate(req, res),
+);
+
+router.post(
+  '/training-orders/print',
+  authorize('authority', 'admin'),
+  (req, res) => trainingOrders.printOrder(req, res),
+);
+
+router.get(
+  '/training-orders',
+  authorize('authority', 'admin'),
+  async (req, res) => {
+    try {
+      const { listTrainingOrders } = require('../training-orders/index');
+      const result = await listTrainingOrders({
+        page: req.query.page,
+        perPage: req.query.perPage,
+        group: req.query.group,
+        status: req.query.status,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      console.error('list training orders failed:', err);
+      res.status(500).json({ ok: false, error: 'Failed to list training orders' });
+    }
+  }
+);
+
+router.get(
+  '/training-orders/:id/download',
+  authorize('authority', 'admin'),
+  (req, res) => trainingOrders.download(req, res),
+);
+
 router.post(
   '/training-batches/create',
   authorize('authority', 'admin'),

@@ -10,6 +10,7 @@ const { Stage2ValidationError } = require('./stage2.errors');
 const { validateStage2Request } = require('./stage2.validator');
 const { isMandalBarred } = require('./stage2.mandal');
 const formation = require('./stage2.formation');
+const { MICRO_OBSERVER_ROLE, assignMicroObservers } = require('../randomization/micro-observer');
 
 /**
  * Team-level 20% substitution (team decision 2026-10-14): this is PER TEAM,
@@ -111,53 +112,135 @@ function createStage2Service(deps) {
       });
       verifyInvariants(t.employees, parties, partySize);
 
-      // --- 20% substitutes per team (team decision 2026-10-14). ----------------
-      // Drawn from the unassigned leftover AFTER core formation. Each team of
-      // size N gets ceil(N x 20%) substitutes (e.g. 7 -> 2). Shortfall is
-      // reported per team, never silently left short. Drawn from t.employees
-      // (full records) so substitutes carry office/seniority fields.
-      var coreKeys = {};
-      parties.forEach(function (party) {
-        party.members.forEach(function (m) { coreKeys[String(m.personnelId)] = true; });
-      });
-      var stillFree = t.employees.filter(function (e) { return !coreKeys[String(e.personnelKey)]; });
-      var subIdx = 0;
-      substituteShortfall = [];
-      parties.forEach(function (party) {
-        var need = substituteCountFor(party.members.length);
-        party.substitutes = [];
-        party.substitutesRequired = need;
-        for (var s = 0; s < need; s += 1) {
-          if (subIdx >= stillFree.length) {
-            substituteShortfall.push({ teamCode: party.teamCode, missing: need - s });
-            break;
-          }
-          var sub = stillFree[subIdx++];
-          party.substitutes.push({
-            personnelId: sub.personnelId,
-            name: sub.name,
-            designation: sub.designation,
-            officeId: sub.officeId,
-            officeName: sub.officeName,
-            seniorityRank: sub.seniorityRank,
-            classification: sub.classification,
-            substituteFor: party.teamCode,
-          });
-        }
-      });
-      parties.forEach(function (party) {
-        (party.substitutes || []).forEach(function (m) {
-          coreKeys[String(m.personnelId)] = true;
-        });
-      });
+      // NOTE: 20% substitutes and one Micro Observer per party are assigned
+      // AFTER both formation paths below (coverage for full and shortage
+      // parties alike) — never silently skipped.
     }
+    // --- ONE Micro Observer per formed party (integrated into Stage 2). ----
+    // SOURCE (team decision 2026-10-15): a SEPARATE MO candidate list
+    // (bank staff uploaded via POST /api/imports/micro-observers) passed as
+    // options.moCandidates. Substitutes always come from OFFICER leftover —
+    // never from the MO list. When moCandidates is absent/empty, fall back to
+    // the legacy path (officer pool + designationRules microObserverEligible)
+    // so existing single-pool flows keep working.
+    var useSeparateMoPool = Array.isArray(t.options.moCandidates) && t.options.moCandidates.length > 0;
+    var moPool;
+    var moById;
+    if (useSeparateMoPool) {
+      moPool = t.options.moCandidates.map(function (c) {
+        return {
+          id: c.personnelId,
+          personnelId: c.personnelId,
+          name: c.name,
+          designation: c.designation,
+          officeId: c.officeId,
+          officeName: c.officeName,
+          workMandal: c.workMandal,
+          nativeMandal: c.nativeMandal,
+          seniorityRank: undefined,
+          classification: 'micro-observer',
+        };
+      });
+      moById = new Map(moPool.map(function (p) { return [String(p.id), p]; }));
+    } else {
+      moPool = t.employees.map(function (e) {
+      return {
+        id: e.personnelKey,
+        personnelId: e.personnelId,
+        name: e.name,
+        designation: e.designation,
+        officeId: e.officeId,
+        officeName: e.officeName,
+        workMandal: e.workMandal,
+        nativeMandal: e.nativeMandal,
+        seniorityRank: e.seniorityRank,
+        classification: e.classification,
+      };
+    });
+      moById = new Map(moPool.map(function (p) { return [String(p.id), p]; }));
+    }
+    // Separate-pool mode: every MO candidate is eligible by upload (the file
+    // IS the authority list); the circular's own mixing rules still apply
+    // (distinct office, no own-mandal). Legacy mode keeps the designationRules
+    // eligibility gate.
+    var moDesignationRules = useSeparateMoPool
+      ? {}
+      : ((t.options && t.options.designationRules) || {});
+    if (useSeparateMoPool) {
+      moPool.forEach(function (p) { moDesignationRules[p.designation] = { microObserverEligible: true }; });
+    }
+    var moPlan = assignMicroObservers({
+      parties: parties,
+      pool: moPool,
+      internalById: moById,
+      designationRules: moDesignationRules,
+      randomInt: randomInt,
+      required: true,
+    });
+    parties = moPlan.parties;
+    var microObserversAssigned = moPlan.assignedCount;
+
+    // --- 20% substitutes per team (team decision 2026-10-14). ----------------
+    // Drawn from the unassigned leftover AFTER core formation AND MO
+    // assignment, so substitutes never reuse a team member or an MO.
+    // Each team of size N gets ceil(N x 20%) substitutes (e.g. 7 -> 2).
+    // Shortfall is reported per team, never silently left short. Drawn from
+    // t.employees (full records) so substitutes carry office/seniority fields.
+    var coreKeys = {};
+    parties.forEach(function (party) {
+      party.members.forEach(function (m) { coreKeys[String(m.personnelId)] = true; });
+    });
+    var stillFree = t.employees.filter(function (e) { return !coreKeys[String(e.personnelKey)]; });
+    var subIdx = 0;
+    substituteShortfall = [];
+    parties.forEach(function (party) {
+      var need = substituteCountFor(party.members.length);
+      party.substitutes = [];
+      party.substitutesRequired = need;
+      for (var s = 0; s < need; s += 1) {
+        if (subIdx >= stillFree.length) {
+          substituteShortfall.push({ teamCode: party.teamCode, missing: need - s });
+          break;
+        }
+        var sub = stillFree[subIdx++];
+        party.substitutes.push({
+          personnelId: sub.personnelId,
+          name: sub.name,
+          designation: sub.designation,
+          officeId: sub.officeId,
+          officeName: sub.officeName,
+          seniorityRank: sub.seniorityRank,
+          classification: sub.classification,
+          substituteFor: party.teamCode,
+        });
+      }
+    });
+    parties.forEach(function (party) {
+      (party.substitutes || []).forEach(function (m) {
+        coreKeys[String(m.personnelId)] = true;
+      });
+    });
+
+    // excelRows: operational members + appended Micro Observer per party.
+    // Source rows stay resolved against full employee records; MO members
+    // from a SEPARATE uploaded pool resolve from the MO pool map instead
+    // (they were never officers, so t.employees cannot contain them).
+    var moSrcById = useSeparateMoPool
+      ? new Map(moPool.map(function (p) {
+        return [String(p.personnelId), {
+          personnelId: p.personnelId, name: p.name, designation: p.designation,
+          officeId: p.officeId, officeName: p.officeName,
+          seniorityRank: p.seniorityRank, classification: p.classification,
+        }];
+      }))
+      : new Map();
     const excelRows = formation.toExcelRows(parties.map(function (p) {
       return {
         teamCode: p.teamCode, postingMandal: p.postingMandal,
         members: p.members.map(function (m) {
           const src = t.employees.find(function (e) {
             return String(e.personnelId) === String(m.personnelId);
-          });
+          }) || moSrcById.get(String(m.personnelId));
           return {
             personnelId: m.personnelId, name: m.name, designation: m.designation,
             officeName: m.officeName, officeKey: src.officeKey,
@@ -186,6 +269,7 @@ function createStage2Service(deps) {
       return { code: 'SUBSTITUTES_SHORT', teamCode: st.teamCode, missing: st.missing,
         message: 'Team could not be given its full 20% substitutes; leftover pool exhausted.' };
     });
+    (moPlan.unmetRequirements || []).forEach(function (u) { unmetRequirements.push(u); });
     if (t.options.partiesRequested > 0 && parties.length < t.options.partiesRequested) {
       unmetRequirements.push({
         code: 'PARTIES_SHORTFALL', requested: t.options.partiesRequested, formed: parties.length,
@@ -204,13 +288,14 @@ function createStage2Service(deps) {
       districtId: t.stage1Run.districtId,
       teamSize: teamSizes.length > 0 ? teamSizes[0] : null,
       teamSizes: teamSizes,
-      fullParties: parties.filter(function (p) { return p.members.length === 6; }).length,
-      shortageParties: parties.filter(function (p) { return p.members.length === 5; }).length,
+      fullParties: parties.filter(function (p) { return (p.operationalSize || p.members.length) === 6; }).length,
+      shortageParties: parties.filter(function (p) { return (p.operationalSize || p.members.length) === 5; }).length,
       presidingOfficersPerParty: PRESIDING_OFFICERS_PER_PARTY,
       pollingOfficersPerParty: t.options.pollingOfficersPerParty,
       shortageReason: t.options.shortageReason,
       parties: parties, excelRows: excelRows, unassigned: unassigned,
       substituteCount: parties.reduce(function (n, party) { return n + (party.substitutes || []).length; }, 0),
+      microObserversAssigned: microObserversAssigned,
       reserveHeld: reserveHeld.map(function (e) {
         return { personnelId: e.personnelId, name: e.name, classification: e.classification };
       }),

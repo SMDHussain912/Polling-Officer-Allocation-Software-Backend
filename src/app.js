@@ -12,7 +12,10 @@ const trainingRoutes = require('./modules/training');
 
 const app = express();
 
-app.use(express.json());
+// 20mb limit matches the imports router's own intent: uploads are base64-JSON
+// (~1.37x file size). The app-level default (100kb) would 413 any workbook
+// over ~75KB before the route-level parser ever runs.
+app.use(express.json({ limit: '20mb' }));
 app.use(
   session({
     secret: config.sessionSecret,

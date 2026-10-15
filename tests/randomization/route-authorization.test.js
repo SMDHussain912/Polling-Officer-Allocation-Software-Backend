@@ -192,6 +192,36 @@ test('publish: authority refuses an incomplete mapping', async () => {
   assert.equal(body.ok, false);
 });
 
+// --- ballot allocation (Phase 3 page endpoint) -------------------------------
+
+test('ballot-allocation: unauthenticated -> 401', async () => {
+  const app = buildApp(undefined);
+  const { status } = await request(app, 'POST', '/api/randomization/ballot-allocation', {});
+  assert.equal(status, 401);
+});
+
+test('ballot-allocation: staff -> 403', async () => {
+  const app = buildApp({ id: 2, username: 'staff1', role: 'staff' });
+  const { status } = await request(app, 'POST', '/api/randomization/ballot-allocation', {});
+  assert.equal(status, 403);
+});
+
+test('ballot-allocation: authority without fileName -> 400', async () => {
+  const app = buildApp(AUTHORITY);
+  const { status, body } = await request(app, 'POST', '/api/randomization/ballot-allocation', {});
+  assert.equal(status, 400);
+  assert.match(body.error, /fileName/);
+});
+
+test('ballot-allocation: authority without dataBase64 -> 400', async () => {
+  const app = buildApp(AUTHORITY);
+  const { status, body } = await request(app, 'POST', '/api/randomization/ballot-allocation', {
+    fileName: 'booths.xlsx',
+  });
+  assert.equal(status, 400);
+  assert.match(body.error, /dataBase64/);
+});
+
 test.after(() => {
   pool.query = realQuery;
 });
