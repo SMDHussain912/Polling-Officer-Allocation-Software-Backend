@@ -642,4 +642,57 @@ router.delete('/order-assignments/:id', authorize('authority', 'admin'), async (
   }
 });
 
+// ---------------------------------------------------------------------------
+// Order generation + email (order-merge engine).
+//   POST /order-assignments/:id/generate            -> generate .docx (metadata)
+//   POST /order-assignments/:id/generate-and-send   -> generate + email attach
+// Templates come from order_templates; metadata from order_config; the merged
+// .docx is emailed as an attachment (Gmail). Fails closed when no template,
+// no email on file, or the provider is unconfigured (never a fake success).
+// ---------------------------------------------------------------------------
+router.post(
+  '/order-assignments/:id/generate',
+  authorize('authority', 'admin'),
+  async (req, res) => {
+    try {
+      const { generateOrderDocx } = require('./order-generation.service');
+      const { fileName, buffer, templateKind } = await generateOrderDocx(req.params.id);
+      res.json({
+        ok: true,
+        fileName,
+        templateKind,
+        bytes: buffer.length,
+        // base64 so the client can download/save without a disk round-trip.
+        docxBase64: buffer.toString('base64'),
+      });
+    } catch (err) {
+      const status = err.statusCode || 500;
+      if (status >= 500) console.error('generate order failed:', err);
+      res.status(status).json({ ok: false, error: err.message || 'Failed to generate order' });
+    }
+  }
+);
+
+router.post(
+  '/order-assignments/:id/generate-and-send',
+  authorize('authority', 'admin'),
+  async (req, res) => {
+    try {
+      const { generateAndSend } = require('./order-generation.service');
+      const result = await generateAndSend({
+        assignmentId: req.params.id,
+        sendEmail: true,
+        actorId: req.session.user.id,
+      });
+      // 200 even when email could not be sent — the doc was generated; the
+      // emailError field explains why it was not emailed (fail-closed, honest).
+      res.json(result);
+    } catch (err) {
+      const status = err.statusCode || 500;
+      if (status >= 500) console.error('generate-and-send failed:', err);
+      res.status(status).json({ ok: false, error: err.message || 'Failed to generate/send order' });
+    }
+  }
+);
+
 module.exports = router;

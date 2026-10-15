@@ -155,16 +155,56 @@ function createGmailProvider(opts) {
         'Gmail is not configured (GMAIL_SENDER_EMAIL / GMAIL_ACCESS_TOKEN missing).'
       );
     }
-    // RFC 2822 message, base64url-encoded for the Gmail users.messages.send API.
     const subject = input.subject || 'Polling Duty Assignment';
-    const raw = [
-      'From: ' + senderEmail,
-      'To: ' + input.to,
-      'Subject: ' + subject,
-      'Content-Type: text/plain; charset="UTF-8"',
-      '',
-      input.message,
-    ].join('\r\n');
+    const attachments = Array.isArray(input.attachments) ? input.attachments : [];
+
+    let raw;
+    if (attachments.length === 0) {
+      // Simple text/plain message (unchanged behaviour).
+      raw = [
+        'From: ' + senderEmail,
+        'To: ' + input.to,
+        'Subject: ' + subject,
+        'Content-Type: text/plain; charset="UTF-8"',
+        '',
+        input.message,
+      ].join('\r\n');
+    } else {
+      // MIME multipart/mixed: one text/plain part + one part per attachment.
+      // Attachment content is expected as base64 (Buffer -> base64 string).
+      const boundary = 'poas_' + Date.now().toString(16) + '_' + Math.random().toString(16).slice(2);
+      const lines = [
+        'From: ' + senderEmail,
+        'To: ' + input.to,
+        'Subject: ' + subject,
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/mixed; boundary="' + boundary + '"',
+        '',
+        '--' + boundary,
+        'Content-Type: text/plain; charset="UTF-8"',
+        'Content-Transfer-Encoding: 7bit',
+        '',
+        input.message,
+      ];
+      for (const att of attachments) {
+        const filename = att.filename || 'attachment';
+        const contentType = att.contentType || 'application/octet-stream';
+        const b64 = typeof att.content === 'string'
+          ? att.content
+          : Buffer.from(att.content || '').toString('base64');
+        lines.push(
+          '--' + boundary,
+          'Content-Type: ' + contentType + '; name="' + filename + '"',
+          'Content-Disposition: attachment; filename="' + filename + '"',
+          'Content-Transfer-Encoding: base64',
+          '',
+          b64
+        );
+      }
+      lines.push('--' + boundary + '--', '');
+      raw = lines.join('\r\n');
+    }
+
     const encoded = Buffer.from(raw, 'utf8').toString('base64url');
     const url = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
     const res = await httpClient(url, {
