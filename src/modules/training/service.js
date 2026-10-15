@@ -106,4 +106,17 @@ function createTrainingService(deps) {
   return { listSessions, createSession, markAttendance, sessionAttendance };
 }
 
-module.exports = { createTrainingService };
+// --- Phase 3-B: separate PO / APO training batches (designation-based) ------
+// NOTE: allocation lives in src/modules/training-orders (from the last
+// completed run's team rows). This module stays a dependency-free,
+// unit-testable helper: split officers by presiding eligibility.
+function splitPoApoLocal(officers) {
+  const groups = { PO: [], APO: [] };
+  for (const o of officers || []) {
+    const po = o && o.presidingEligible === true;
+    groups[po ? 'PO' : 'APO'].push(o);
+  }
+  return groups;
+}
+
+module.exports = { createTrainingService, splitPoApoLocal };

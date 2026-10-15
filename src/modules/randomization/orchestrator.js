@@ -6,7 +6,6 @@ const stage3Module = require('../randomization-stage-3');
 const { createStage1Service, createInMemoryStage1Repository } = stage1Module;
 const { formPollingParties } = stage2Module;
 const { createStage3Service } = stage3Module;
-const { assignMicroObservers } = require('./micro-observer');
 
 /**
  * Map a DB personnel row (+ its batch department name) into the internal shape
@@ -127,6 +126,12 @@ function buildStations(stationRows) {
  *        column; without overrides officeId falls back to the import batch's
  *        department name (coarse — Stage 2 may then report it cannot form
  *        complete parties; that is fail-closed, not a bug).
+ * @param {Array}  [input.moRows]
+ *        DB micro_observers rows (separate MO upload: bank staff). When
+ *        supplied and non-empty, MOs are drawn ONLY from this list —
+ *        never from officers. Substitutes always come from officer
+ *        leftover, never from moRows. Omitted/empty keeps the legacy
+ *        single-pool behavior.
  * @param {string} input.districtId   District scope (Stage 1 actor scope).
  * @param {number|string} input.actorId  Authenticated user id (audit trail).
  * @param {number} [input.seed]  Optional RNG seed for reproducible demos.
@@ -136,7 +141,7 @@ async function runAllocation(input) {
   const {
     personnelRows, stationRows, departmentName,
     electionConfiguration, designationRules,
-    districtId, actorId, seed, officeIdOverrides,
+    districtId, actorId, seed, officeIdOverrides, moRows,
   } = input || {};
 
   if (!Array.isArray(personnelRows) || personnelRows.length === 0) {
@@ -199,6 +204,41 @@ async function runAllocation(input) {
   // which is correct behaviour, not a bug.
   const postingMandals = stationRows.map(function (s) { return s.mandal; });
   const employees = buildEmployees(runResults.results, internalById, designationRules);
+  // Separate MO upload (bank staff via POST /api/imports/micro-observers):
+  // map DB micro_observers rows to Stage 2 moCandidates. Bank name doubles
+  // as the office key so two MOs from the same bank never land on one team
+  // (distinct-office rule). Missing work/native mandal falls back to the
+  // residence mandal, then a neutral token (never blank — validator needs it).
+  const moCandidates = Array.isArray(moRows)
+    ? moRows
+      .filter(function (r) {
+        return r && r.employee_id !== undefined && r.employee_id !== null &&
+          String(r.employee_id).trim() !== '' && r.employee_name &&
+          String(r.employee_name).trim() !== '';
+      })
+      .map(function (r) {
+        const bank = r.bank_name && String(r.bank_name).trim() !== ''
+          ? String(r.bank_name).trim() : ('bank:' + String(r.employee_id).trim());
+        const workM = r.working_mandal && String(r.working_mandal).trim() !== ''
+          ? String(r.working_mandal).trim()
+          : (r.residence_mandal && String(r.residence_mandal).trim() !== ''
+            ? String(r.residence_mandal).trim() : 'MO-UNLISTED');
+        const natM = r.native_mandal && String(r.native_mandal).trim() !== ''
+          ? String(r.native_mandal).trim()
+          : (r.residence_mandal && String(r.residence_mandal).trim() !== ''
+            ? String(r.residence_mandal).trim() : 'MO-UNLISTED');
+        return {
+          personnelId: String(r.employee_id).trim(),
+          name: String(r.employee_name).trim(),
+          designation: r.designation && String(r.designation).trim() !== ''
+            ? String(r.designation).trim() : 'Micro Observer',
+          officeId: bank,
+          officeName: bank,
+          workMandal: workM,
+          nativeMandal: natM,
+        };
+      })
+    : null;
   const stage1Run = {
     runId: stage1.runId,
     stage: 1,
@@ -213,34 +253,25 @@ async function runAllocation(input) {
       employees: employees,
       options: {
         postingMandals: postingMandals,
-        seed: seed !== undefined && seed !== null ? seed : undefined,
+        // Micro Observer eligibility now flows into Stage 2 itself; Stage 2
+        // assigns exactly one MO per formed party (fail closed when none can
+        // be placed) and reports it on the returned run. When the separate
+        // MO upload was supplied (moCandidates), MOs come ONLY from that
+        // bank-staff list; substitutes still come from officer leftover.
+        designationRules: designationRules,
+        moCandidates: moCandidates,
       },
     },
     { randomInt: randomInt }
   );
 
-  // --- Micro Observer: one per formed party (NEW requirement). -------------
-  // Runs AFTER Stage 2's tested formation engine (untouched). The MO is an
-  // additional member; teamSize grows by 1 and operationalSize preserves the
-  // PO+Polling-Officer count. Eligibility is authority-supplied via
-  // designationRules[...].microObserverEligible (never invented).
-  const moPlan = assignMicroObservers({
-    parties: stage2.parties,
-    pool: internal,
-    internalById: internalById,
-    designationRules: designationRules,
-    randomInt: randomInt,
-    required: true,
-  });
-  // Party view handed to Stage 3 + response: operational parties + their MO.
+  // Micro Observers are integrated in Stage 2 itself (one per formed party,
+  // teamSize counts the MO, operationalSize preserves PO+Polling count).
+  // Fail closed: a party missing its Micro Observer is not deployment-ready.
   const stage2WithMo = Object.assign({}, stage2, {
-    parties: moPlan.parties,
-    // Merge MO placement failures into Stage 2's own unmet requirements.
-    unmetRequirements: (stage2.unmetRequirements || []).concat(moPlan.unmetRequirements),
-    microObserversAssigned: moPlan.assignedCount,
+    microObserversAssigned: stage2.microObserversAssigned || 0,
   });
-  if (moPlan.unmetRequirements.length > 0) {
-    // Fail closed: a party missing its Micro Observer is not deployment-ready.
+  if ((stage2.unmetRequirements || []).some(function (u) { return u.code === 'MICRO_OBSERVER_NOT_ASSIGNED'; })) {
     stage2WithMo.status = 'incomplete';
   }
 

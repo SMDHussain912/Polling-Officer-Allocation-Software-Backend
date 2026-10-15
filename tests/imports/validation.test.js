@@ -70,9 +70,9 @@ test('normalizeDate handles dd.mm.yyyy edge cases', () => {
   assert.deepStrictEqual(normalizeDate(''), { value: null });
 });
 
-test('below 21 by DOB is rejected with below_minimum_age', () => {
+test('below 18 by DOB is rejected with below_minimum_age', () => {
   const young = new Date();
-  young.setUTCFullYear(young.getUTCFullYear() - 20);
+  young.setUTCFullYear(young.getUTCFullYear() - 17);
   const dob = `${String(young.getUTCDate()).padStart(2, '0')}.${String(young.getUTCMonth() + 1).padStart(2, '0')}.${young.getUTCFullYear()}`;
   const { accepted, rejected } = validateRows([
     row(7, { employee_id: 'Y1', employee_name: 'Young', date_of_birth: dob }),
@@ -81,9 +81,9 @@ test('below 21 by DOB is rejected with below_minimum_age', () => {
   assert.deepStrictEqual(rejected[0].reasons, ['below_minimum_age']);
 });
 
-test('exactly 21 by DOB today is accepted (birthday counts)', () => {
+test('exactly 18 by DOB today is accepted (birthday counts)', () => {
   const adult = new Date();
-  adult.setUTCFullYear(adult.getUTCFullYear() - 21);
+  adult.setUTCFullYear(adult.getUTCFullYear() - 18);
   const dob = `${String(adult.getUTCDate()).padStart(2, '0')}.${String(adult.getUTCMonth() + 1).padStart(2, '0')}.${adult.getUTCFullYear()}`;
   const { accepted } = validateRows([
     row(7, { employee_id: 'A1', employee_name: 'Adult', date_of_birth: dob }),
@@ -92,7 +92,7 @@ test('exactly 21 by DOB today is accepted (birthday counts)', () => {
 });
 
 test('blank DOB falls back to Age column; both blank is accepted', () => {
-  const low = validateRows([row(7, { employee_id: 'L1', employee_name: 'L', age: '18' })]);
+  const low = validateRows([row(7, { employee_id: 'L1', employee_name: 'L', age: '15' })]);
   assert.deepStrictEqual(low.rejected[0].reasons, ['below_minimum_age']);
   const ok = validateRows([row(7, { employee_id: 'O1', employee_name: 'O', age: '30' })]);
   assert.strictEqual(ok.accepted.length, 1);
@@ -103,4 +103,87 @@ test('blank DOB falls back to Age column; both blank is accepted', () => {
 test('non-numeric Age is not an age basis (row accepted)', () => {
   const { accepted } = validateRows([row(7, { employee_id: 'X1', employee_name: 'X', age: 'forty' })]);
   assert.strictEqual(accepted.length, 1);
+});
+
+test('age_dob_age_mismatch: DOB and Age column disagree by more than 2 years -> rejected', () => {
+  // DOB 1980 -> age ~46; Age column says 30. Diff = 16 > 2.
+  const { rejected } = validateRows([
+    row(7, { employee_id: 'M1', employee_name: 'M', date_of_birth: '01.01.1980', age: '30' }),
+  ]);
+  assert.strictEqual(rejected[0].reasons.includes('age_dob_age_mismatch'), true);
+});
+
+test('age_dob_age_mismatch: DOB and Age column agree within 2 years -> accepted', () => {
+  // DOB 1980 -> age ~46; Age column says 47. Diff = 1 <= 2.
+  const { accepted } = validateRows([
+    row(7, { employee_id: 'M2', employee_name: 'M', date_of_birth: '01.01.1980', age: '47' }),
+  ]);
+  assert.strictEqual(accepted.length, 1);
+  assert.strictEqual(accepted[0].age, '47');
+});
+
+test('age_dob_age_mismatch: blank Age with DOB present -> no mismatch check', () => {
+  const { accepted } = validateRows([
+    row(7, { employee_id: 'M3', employee_name: 'M', date_of_birth: '01.01.1980', age: '' }),
+  ]);
+  assert.strictEqual(accepted.length, 1);
+});
+
+test('age_dob_age_mismatch: non-numeric Age with DOB present -> no mismatch check', () => {
+  const { accepted } = validateRows([
+    row(7, { employee_id: 'M4', employee_name: 'M', date_of_birth: '01.01.1980', age: 'forty' }),
+  ]);
+  assert.strictEqual(accepted.length, 1);
+});
+
+test('age_dob_age_mismatch: mismatch and below_minimum_age combine on one row', () => {
+  // DOB 2005 -> age ~21 (>= 18 so no below_minimum_age); Age col 40. Diff = 19 > 2.
+  const { rejected } = validateRows([
+    row(7, { employee_id: 'M5', employee_name: 'M', date_of_birth: '01.01.2005', age: '40' }),
+  ]);
+  assert.strictEqual(rejected[0].reasons.includes('age_dob_age_mismatch'), true);
+  assert.strictEqual(rejected[0].reasons.includes('below_minimum_age'), false);
+});
+
+test('medical designations are HARD-rejected (doctors, nurses, homeopathy, ayurveda)', () => {
+  const cases = [
+    'doctor', 'Doctor', 'DOCTOR', 'Staff Nurse', 'NURSE', 'ANM', 'Homeopath', 'Homoeopath',
+    'Ayurvedic Doctor', 'ayurvedic', 'Unani Doctor', 'Compounder', 'Pharmacist', 'Dispenser',
+    'Medical Officer', 'Civil Surgeon', 'MBBS Doctor', 'Veterinary Doctor',
+  ];
+  for (const designation of cases) {
+    const { accepted, rejected } = validateRows([
+      row(7, { employee_id: `MED-${designation.replace(/\s+/g, '')}`, employee_name: 'M', date_of_birth: '01.01.1980', designation }),
+    ]);
+    assert.strictEqual(accepted.length, 0, `designation ${JSON.stringify(designation)} must be rejected`);
+    assert.strictEqual(rejected[0].reasons.includes('medical_designation_not_eligible'), true, `designation ${JSON.stringify(designation)} reason`);
+  }
+});
+
+test('medical reject is department-independent and is a HARD reject (not exempt_category)', () => {
+  const { rejected } = validateRows([
+    row(7, { employee_id: 'D1', employee_name: 'D', date_of_birth: '01.01.1980', designation: 'doctor' }),
+  ]);
+  // HARD reject: exactly one reason, the medical code — no exempt_category involved.
+  assert.deepStrictEqual(rejected[0].reasons, ['medical_designation_not_eligible']);
+});
+
+test('non-medical designations pass the medical check (no false positives)', () => {
+  const cases = ['Senior Assistant', 'Data Entry Operator', 'Section Officer', 'Junior Accountant', 'Typist', 'Assistant Engineer', 'Attender'];
+  for (const designation of cases) {
+    const { accepted } = validateRows([
+      row(7, { employee_id: `OK-${designation.replace(/\s+/g, '')}`, employee_name: 'O', date_of_birth: '01.01.1980', designation }),
+    ]);
+    assert.strictEqual(accepted.length, 1, `designation ${JSON.stringify(designation)} must be accepted`);
+  }
+});
+
+test('age_dob_age_mismatch: DOB under-18 AND mismatch -> both reasons', () => {
+  // DOB 2010 -> age ~16 (< 18); Age col 30. Both reasons fire.
+  // DOB 2010 -> age ~16 (< 18); Age col 30. Both reasons fire.
+  const { rejected } = validateRows([
+    row(7, { employee_id: 'M6', employee_name: 'M', date_of_birth: '01.01.2010', age: '30' }),
+  ]);
+  assert.strictEqual(rejected[0].reasons.includes('below_minimum_age'), true);
+  assert.strictEqual(rejected[0].reasons.includes('age_dob_age_mismatch'), true);
 });

@@ -7,6 +7,7 @@
  *   POST /personnel               -> authority, admin
  *   GET  /batches                 -> staff, authority, admin
  *   GET  /batches/:id/personnel   -> staff, authority, admin
+ *   GET  /batches/:id/rejected    -> staff, authority, admin
  *
  * Uses a real Express round-trip with a stubbed pool (no live database) and an
  * injectable session role. Unauthenticated -> 401; wrong role -> 403; allowed
@@ -26,6 +27,9 @@ const importsRouter = require('../../src/modules/imports');
 // --- pool stub (never touches PostgreSQL) ------------------------------------
 const realQuery = pool.query;
 pool.query = async (sql) => {
+  if (/FROM import_batches/i.test(sql) && /WHERE id = /i.test(sql)) {
+    return { rows: [{ id: 7, file_name: 'f.xlsx', department_name: 'Ed', total_rows: 1, accepted_rows: 1, rejected_rows: 0, status: 'completed', imported_at: '2026-01-01T00:00:00Z' }] };
+  }
   if (/FROM import_batches/i.test(sql) && /COUNT/i.test(sql) === false && /SELECT id, file_name, department_name, total_rows, accepted_rows, status/i.test(sql)) {
     return { rows: [{ id: 7, file_name: 'f.xlsx', department_name: 'Ed', total_rows: 1, accepted_rows: 1, status: 'completed', imported_at: '2026-01-01T00:00:00Z' }] };
   }
@@ -121,6 +125,24 @@ test('GET /batches/:id/personnel: staff allowed -> 200', async () => {
 
 test('GET /batches/:id/personnel: unknown role -> 403', async () => {
   const { status } = await request(buildApp({ id: 1, role: 'guest' }), 'GET', '/api/imports/batches/7/personnel');
+  assert.equal(status, 403);
+});
+
+// --- GET /batches/:id/rejected: staff, authority, admin -----------------------
+
+test('GET /batches/:id/rejected: unauthenticated -> 401', async () => {
+  const { status } = await request(buildApp(undefined), 'GET', '/api/imports/batches/7/rejected');
+  assert.equal(status, 401);
+});
+
+test('GET /batches/:id/rejected: staff allowed -> 200 with rejected rows', async () => {
+  const { status, body } = await request(buildApp({ id: 1, role: 'staff' }), 'GET', '/api/imports/batches/7/rejected');
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+});
+
+test('GET /batches/:id/rejected: unknown role -> 403', async () => {
+  const { status } = await request(buildApp({ id: 1, role: 'guest' }), 'GET', '/api/imports/batches/7/rejected');
   assert.equal(status, 403);
 });
 
