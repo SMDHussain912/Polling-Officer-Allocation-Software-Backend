@@ -615,6 +615,11 @@ async function downloadTrainingOrder(group, id) {
     throw err;
   }
   const order = r.rows[0];
+  if (!order.order_docx) {
+    const err = new Error('Training order has not been generated yet — run Generate/Print first');
+    err.statusCode = 404;
+    throw err;
+  }
   return {
     order,
     buffer: order.order_docx,
