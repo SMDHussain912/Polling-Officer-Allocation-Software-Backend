@@ -43,6 +43,12 @@ const {
   createTrainingBatches,
   clearTrainingBatches,
 } = require('./intake.service');
+const {
+  listAssignments,
+  createAssignment,
+  updateAssignment,
+  deleteAssignment,
+} = require('./order-assignment.service');
 const { IntakeParseError } = require('./intake');
 const { ImportParseError } = require('./excel.parser');
 
@@ -562,6 +568,78 @@ router.get(
       res.status(500).json({ ok: false, error: 'Failed to load idcard design' });
     }
   }
-
 );
+
+// ---------------------------------------------------------------------------
+// Manual appointments (order_assignments) — Stage Officer II / counting team.
+// NOT produced by randomization; an admin picks personnel by hand. The server
+// validates shape + existence and persists; it never invents a person/role.
+//   GET    /order-assignments[?orderKind=stage_officer_ii|counting_team]
+//   POST   /order-assignments          (authority, admin)
+//   PATCH  /order-assignments/:id      (authority, admin)
+//   DELETE /order-assignments/:id      (authority, admin)
+// ---------------------------------------------------------------------------
+router.get('/order-assignments', authorize('staff', 'authority', 'admin'), async (req, res) => {
+  try {
+    const rows = await listAssignments({ orderKind: req.query.orderKind });
+    res.json({ ok: true, count: rows.length, assignments: rows });
+  } catch (err) {
+    if (err.statusCode === 400) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+    console.error('list order assignments failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load appointments' });
+  }
+});
+
+router.post('/order-assignments', authorize('authority', 'admin'), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const created = await createAssignment({
+      orderKind: body.orderKind,
+      personnelId: body.personnelId,
+      role: body.role,
+      teamNo: body.teamNo,
+      tableNo: body.tableNo,
+      bodyName: body.bodyName,
+      createdBy: req.session.user.id,
+    });
+    res.status(201).json({ ok: true, assignment: created });
+  } catch (err) {
+    const status = err.statusCode || 500;
+    if (status >= 500) console.error('create order assignment failed:', err);
+    res.status(status).json({ ok: false, error: err.message || 'Failed to create appointment' });
+  }
+});
+
+router.patch('/order-assignments/:id', authorize('authority', 'admin'), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const updated = await updateAssignment({
+      id: req.params.id,
+      role: body.role,
+      teamNo: body.teamNo,
+      tableNo: body.tableNo,
+      bodyName: body.bodyName,
+      personnelId: body.personnelId,
+    });
+    res.json({ ok: true, assignment: updated });
+  } catch (err) {
+    const status = err.statusCode || 500;
+    if (status >= 500) console.error('update order assignment failed:', err);
+    res.status(status).json({ ok: false, error: err.message || 'Failed to update appointment' });
+  }
+});
+
+router.delete('/order-assignments/:id', authorize('authority', 'admin'), async (req, res) => {
+  try {
+    const result = await deleteAssignment({ id: req.params.id });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    const status = err.statusCode || 500;
+    if (status >= 500) console.error('delete order assignment failed:', err);
+    res.status(status).json({ ok: false, error: err.message || 'Failed to delete appointment' });
+  }
+});
+
 module.exports = router;
