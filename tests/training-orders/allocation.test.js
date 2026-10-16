@@ -2,86 +2,91 @@
 
 /**
  * tests/training-orders/allocation.test.js
- *
- * Pure-logic tests for training-orders (no DB): the PO/APO split is
- * designation-based (presidingEligible === true -> PO, everyone else ->
- * APO), MO invitees live in their own table and are never passed in, and
- * buildTrainingOrderDocx merges {{tags}} via the proven order-merge engine.
- *
- * Run: node --test tests/training-orders/
+ * Pure + stubbed-pool tests for PO/APO split, MO skip, tagged template merge.
  */
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-
+const fs = require('fs');
+const path = require('path');
 const PizZip = require('pizzip');
-const Docxtemplater = require('docxtemplater');
 
 const orderMerge = require('../../src/modules/imports/order-merge.service');
+const {
+  classifyRole,
+  parseTrainingDate,
+  allocateTraining,
+  buildOrdersZip,
+} = require('../../src/modules/training-orders/index');
 
-// The split logic lives in training/service.js (dependency-free helper).
-const { splitPoApoLocal } = require('../../src/modules/training/service');
-
-test('PO/APO split is designation-based; MO rows never included', () => {
-  const officers = [
-    { name: 'A', presidingEligible: true },
-    { name: 'B', presidingEligible: false },
-    { name: 'C' }, // no flag -> APO
-  ];
-  const groups = splitPoApoLocal(officers);
-  assert.equal(groups.PO.length, 1);
-  assert.equal(groups.PO[0].name, 'A');
-  assert.equal(groups.APO.length, 2);
+test('classifyRole: PO / APO / MO', () => {
+  assert.equal(classifyRole('Presiding Officer'), 'PO');
+  assert.equal(classifyRole('Polling Officer 1'), 'APO');
+  assert.equal(classifyRole('Polling Officer 5'), 'APO');
+  assert.equal(classifyRole('Micro Observer'), 'MO');
+  assert.equal(classifyRole('micro observer (bank)'), 'MO');
 });
 
-function minimalDocxBuffer() {
-  // Smallest valid .docx: [Content_Types].xml + word/document.xml with tags.
-  const zip = new PizZip();
-  zip.file(
-    '[Content_Types].xml',
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
-      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
-      '<Default Extension="xml" ContentType="application/xml"/>' +
-      '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
-      '</Types>'
-  );
-  zip.file('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>');
-  zip.file(
-    'word/document.xml',
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
-      '<w:body><w:p><w:r><w:t>Order {order_id} group {training_group} mandal {mandal}</w:t></w:r></w:p></w:body>' +
-      '</w:document>'
-  );
-  return zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
-}
+test('parseTrainingDate supports dd.mm.yyyy', () => {
+  const p = parseTrainingDate('20.10.2026');
+  assert.equal(p.dd, '20');
+  assert.equal(p.mm, '10');
+  assert.equal(p.yyyy, '2026');
+  assert.ok(p.weekday);
+});
 
-test('mergeDocx fills training order {{tags}} (proven engine)', () => {
-  const template = minimalDocxBuffer();
-  const out = orderMerge.mergeDocx(template, {
-    order_id: 'TR-1',
-    training_group: 'PO',
-    mandal: 'Kakinada Rural',
+test('built-in tagged PO template merges officer + training FROM-TO fields', () => {
+  const templatePath = path.join(__dirname, '../../docs/po-order-tagged.docx');
+  assert.ok(fs.existsSync(templatePath), 'po-order-tagged.docx must exist');
+  const out = orderMerge.mergeDocx(fs.readFileSync(templatePath), {
+    sl_no: '7',
+    district: 'Kakinada',
+    employee_id: 'EMP9',
+    employee_name: 'Rama Rao',
+    designation_dept: 'Clerk / Revenue',
+    office_address: 'Revenue Department',
+    mobile_no: '9000000000',
+    order_date: '15.10.2026',
+    order_place: 'Kakinada',
+    election_year: '2026',
+    training_dd: '20',
+    training_mm: '10',
+    training_weekday: 'Tuesday',
+    training_time_from: '10:00 AM',
+    training_time_to: '01:00 PM',
+    training_venue: 'ZPHS Samalkot',
+    duty_mandal: 'Samalkot',
+    ack_name: 'Rama Rao',
+    ack_designation: 'Clerk',
+    ack_mobile: '9000000000',
+    ack_work_mandal: 'Kakinada Rural',
   });
-  assert.ok(Buffer.isBuffer(out));
-  assert.ok(out.length > 0);
-  // Rendered text survives the round-trip.
-  const zip = new PizZip(out);
-  const doc = new Docxtemplater(zip, { paragraphLoop: true, linebreaks: true });
-  const xml = zip.files['word/document.xml'].asText();
-  assert.ok(xml.includes('TR-1'));
-  assert.ok(xml.includes('PO'));
-  assert.ok(!xml.includes('{order_id}'));
-  assert.ok(doc);
+  const xml = new PizZip(out).file('word/document.xml').asText();
+  assert.ok(xml.includes('Rama Rao'));
+  assert.ok(xml.includes('10:00 AM'));
+  assert.ok(xml.includes('01:00 PM'));
+  assert.ok(xml.includes('Samalkot'));
+  assert.ok(xml.includes('Kakinada Rural'));
+  assert.ok(!xml.includes('{employee_name}'));
+  assert.ok(!xml.includes('{{employee_name}}'));
 });
 
-test('allocateTraining batches PO/APO separately per mandal (stubbed pool)', async () => {
+test('allocateTraining wipes + splits PO/APO per mandal; skips MO (stubbed pool)', async () => {
   const pool = require('../../src/database');
   const store = require('../../src/modules/randomization/allocation-store');
-  const { allocateTraining } = require('../../src/modules/training-orders/index');
-
-  // Last run: 1 PO + 2 APOs in mandal M1, 1 PO in mandal M2.
+  // recordRun writes via pool.query (allocation_runs insert) — stub it so the
+  // test never touches the live DB. The id it returns scopes the 014 tables.
+  const realQuery = pool.query;
+  pool.query = async (sql) => {
+    if (/INSERT INTO allocation_runs/i.test(String(sql))) {
+      return { rows: [{ id: 999, run_at: new Date() }] };
+    }
+    // cold-start hydrate / stage-table read both return empty -> run JSON path
+    if (/FROM allocation_runs|FROM stage2_team_members/i.test(String(sql))) {
+      return { rows: [] };
+    }
+    throw new Error('unexpected pool.query in test: ' + String(sql).slice(0, 100));
+  };
   await store.recordRun({
     runAt: new Date().toISOString(),
     runBy: { id: 1, username: 't', role: 'authority' },
@@ -89,37 +94,119 @@ test('allocateTraining batches PO/APO separately per mandal (stubbed pool)', asy
     stage2: {
       status: 'completed',
       excelRows: [
-        { teamCode: 'T1', mandal: 'M1', role: 'Presiding Officer', employeeId: '101', name: 'PO1', designation: 'D', office: 'O' },
-        { teamCode: 'T1', mandal: 'M1', role: 'Polling Officer 1', employeeId: '102', name: 'APO1', designation: 'D', office: 'O' },
-        { teamCode: 'T1', mandal: 'M1', role: 'Polling Officer 2', employeeId: '103', name: 'APO2', designation: 'D', office: 'O' },
-        { teamCode: 'T2', mandal: 'M2', role: 'Presiding Officer', employeeId: '104', name: 'PO2', designation: 'D', office: 'O' },
+        { teamCode: 'T1', mandal: 'M1', role: 'Presiding Officer', employeeId: 'E101', name: 'PO1' },
+        { teamCode: 'T1', mandal: 'M1', role: 'Polling Officer 1', employeeId: 'E102', name: 'APO1' },
+        { teamCode: 'T1', mandal: 'M1', role: 'Polling Officer 2', employeeId: 'E103', name: 'APO2' },
+        { teamCode: 'T1', mandal: 'M1', role: 'Micro Observer', employeeId: 'MO1', name: 'MO1' },
+        { teamCode: 'T2', mandal: 'M2', role: 'Presiding Officer', employeeId: 'E104', name: 'PO2' },
       ],
     },
     stage3: { status: 'completed' },
   });
 
+  const personnelByEmp = {
+    E101: { id: 1, employee_id: 'E101', employee_name: 'PO1', designation: 'D', mobile_no: null, work_mandal: 'W', residence_address: null, department_name: 'Dept' },
+    E102: { id: 2, employee_id: 'E102', employee_name: 'APO1', designation: 'D', mobile_no: null, work_mandal: 'W', residence_address: null, department_name: 'Dept' },
+    E103: { id: 3, employee_id: 'E103', employee_name: 'APO2', designation: 'D', mobile_no: null, work_mandal: 'W', residence_address: null, department_name: 'Dept' },
+    E104: { id: 4, employee_id: 'E104', employee_name: 'PO2', designation: 'D', mobile_no: null, work_mandal: 'W', residence_address: null, department_name: 'Dept' },
+  };
+
   const realConnect = pool.connect;
   let seq = 500;
   pool.connect = async () => ({
-    query: async (sql) => {
+    query: async (sql, params) => {
       const s = String(sql);
       if (/BEGIN|COMMIT|ROLLBACK/i.test(s)) return { rows: [] };
-      if (/MAX\(batch_no\)/i.test(s)) return { rows: [{ max_no: '0' }] };
-      if (/INSERT INTO training_batches/i.test(s)) return { rows: [{ id: seq++ }] };
-      if (/INSERT INTO training_batch_members/i.test(s)) return { rows: [] };
-      throw new Error('unexpected SQL in test: ' + s.slice(0, 80));
+      if (/DELETE FROM (po|apo)_training/i.test(s)) return { rows: [] };
+      if (/FROM personnel p/i.test(s) && /employee_id = ANY/i.test(s)) {
+        const ids = params[0] || [];
+        return { rows: ids.map((id) => personnelByEmp[id]).filter(Boolean) };
+      }
+      if (/INSERT INTO (po|apo)_training_batches/i.test(s)) {
+        return { rows: [{ id: seq++ }] };
+      }
+      if (/INSERT INTO (po|apo)_training_batch_members/i.test(s)) {
+        return { rows: [] };
+      }
+      throw new Error('unexpected SQL in test: ' + s.slice(0, 120));
     },
     release: async () => {},
   });
+
   try {
     const result = await allocateTraining({ createdBy: 1 });
     assert.equal(result.errors.length, 0);
-    // PO/M1, APO/M1, PO/M2 -> 3 batches.
+    assert.equal(result.skippedMo, 1);
     assert.equal(result.batches.length, 3);
     const groups = result.batches.map((b) => b.group + '/' + b.mandal).sort();
     assert.deepEqual(groups, ['APO/M1', 'PO/M1', 'PO/M2']);
   } finally {
     pool.connect = realConnect;
+    pool.query = realQuery;
     store._reset();
+  }
+});
+
+test('allocateTraining prefers stage tables (014) over run JSON', async () => {
+  const pool = require('../../src/database');
+  // latestStageTables reads via pool.query — stub a stored run with a
+  // pre-classified PO + APO row (MO already excluded at persist time).
+  const realQuery = pool.query;
+  const stageRows = [
+    { run_id: 7, team_code: 'T1', employee_id: 'E201', personnel_id: 11, role: 'Presiding Officer', duty: null, training_group: 'PO', mandal: 'M9', station_id: null, station_code: null, station_mandal: null, publication_status: 'confidential' },
+    { run_id: 7, team_code: 'T1', employee_id: 'E202', personnel_id: 12, role: 'Polling Officer 1', duty: null, training_group: 'APO', mandal: 'M9', station_id: null, station_code: null, station_mandal: null, publication_status: 'confidential' },
+  ];
+  pool.query = async (sql) => {
+    const s = String(sql);
+    if (/FROM stage2_team_members/i.test(s)) return { rows: stageRows };
+    // cold-start hydrate returns no prior run -> falls to stage tables
+    if (/FROM allocation_runs/i.test(s)) return { rows: [] };
+    throw new Error('unexpected pool.query in test: ' + s.slice(0, 100));
+  };
+
+  const personnelByEmp = {
+    E201: { id: 11, employee_id: 'E201', employee_name: 'PO9', designation: 'D', mobile_no: null, work_mandal: 'W', residence_address: null, department_name: 'Dept' },
+    E202: { id: 12, employee_id: 'E202', employee_name: 'APO9', designation: 'D', mobile_no: null, work_mandal: 'W', residence_address: null, department_name: 'Dept' },
+  };
+  const realConnect = pool.connect;
+  let seq = 700;
+  pool.connect = async () => ({
+    query: async (sql, params) => {
+      const s = String(sql);
+      if (/BEGIN|COMMIT|ROLLBACK/i.test(s)) return { rows: [] };
+      if (/DELETE FROM (po|apo)_training/i.test(s)) return { rows: [] };
+      if (/FROM personnel p/i.test(s) && /employee_id = ANY/i.test(s)) {
+        const ids = params[0] || [];
+        return { rows: ids.map((id) => personnelByEmp[id]).filter(Boolean) };
+      }
+      if (/INSERT INTO (po|apo)_training_batches/i.test(s)) return { rows: [{ id: seq++ }] };
+      if (/INSERT INTO (po|apo)_training_batch_members/i.test(s)) return { rows: [] };
+      throw new Error('unexpected SQL in test: ' + s.slice(0, 120));
+    },
+    release: async () => {},
+  });
+
+  try {
+    const result = await allocateTraining({ createdBy: 1 });
+    assert.equal(result.errors.length, 0);
+    assert.equal(result.source, 'stage_tables');
+    assert.equal(result.stageRunId, 7);
+    assert.equal(result.skippedMo, 0);
+    const groups = result.batches.map((b) => b.group + '/' + b.mandal).sort();
+    assert.deepEqual(groups, ['APO/M9', 'PO/M9']);
+  } finally {
+    pool.connect = realConnect;
+    pool.query = realQuery;
+  }
+});
+
+test('buildOrdersZip 404 when empty (uses live pool query — stub)', async () => {
+  const pool = require('../../src/database');
+  const realQuery = pool.query;
+  pool.query = async () => ({ rows: [] });
+  try {
+    await assert.rejects(() => buildOrdersZip('PO'), (err) => err.statusCode === 404);
+  } finally {
+    pool.query = realQuery;
   }
 });

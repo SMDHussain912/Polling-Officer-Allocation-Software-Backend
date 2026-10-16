@@ -39,6 +39,7 @@ const { persistPersonnelImport, patchPersonnelExemption } = require('./import.se
 const {
   replaceMicroObservers,
   replaceTrainingLocations,
+  replaceTrainingSessions,
   replaceRequirements,
   createTrainingBatches,
   clearTrainingBatches,
@@ -138,13 +139,14 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
 
     // Full data: every proforma column stored at import time, no row cap, so
     // Phase 1 shows the same total data that is present in the database.
-    // Projection stays an EXPLICIT column list (never SELECT *) and NEVER
-    // selects aadhar_number / voter_id / mobile_no — that privacy rule was
-    // approved for this endpoint and must not regress. Full proforma columns
-    // that are safe to display are camelCase-projected for the frontend.
+    // Projection stays an EXPLICIT column list (never SELECT *). voter_id is
+    // never selected (kept private); aadhar_number and mobile_no are returned
+    // so the Phase 1 frontend can render them. Remaining proforma columns are
+    // camelCase-projected for the frontend.
     const result = await pool.query(
       `SELECT id, import_batch_id, import_status, district, exempt_category,
               sl_no, employee_id, employee_name, designation, gender, age,
+              aadhar_number, mobile_no,
               languages_known, employment_sector, scale_of_pay,
               basic_pay, gazetted_status, date_of_birth, date_of_retirement,
               employment_type, enrolled_assembly_constituency, part_no_vote_sl_no,
@@ -172,6 +174,8 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
       designation: r.designation,
       gender: r.gender,
       age: r.age,
+      aadharNumber: r.aadhar_number,
+      mobileNo: r.mobile_no,
       languagesKnown: r.languages_known,
       employmentSector: r.employment_sector,
       scaleOfPay: r.scale_of_pay,
@@ -247,6 +251,21 @@ router.get(
 
 // Personal exemption workflow (circular p.61(a)(viii) + p.61(a)(vii) bank).
 // Marker is updated only; the response never exposes medical status.
+// Personnel edit (admin correction after import):
+//   PATCH /personnel/:id   { ...allow-listed fields }
+// Only identity-safe editable columns are written (see personnel-edit.service
+// EDITABLE); identity / import-control / sensitive columns are ignored.
+router.patch('/personnel/:id', authorize('authority', 'admin'), async (req, res) => {
+  try {
+    const { editPersonnel } = require('./personnel-edit.service');
+    const result = await editPersonnel({ id: req.params.id, fields: req.body || {} });
+    res.json(result);
+  } catch (err) {
+    const status = err.statusCode || 500;
+    if (status >= 500) console.error('edit personnel failed:', err);
+    res.status(status).json({ ok: false, error: err.message || 'Failed to update personnel' });
+  }
+});
 router.patch(
   '/batches/:batchId/personnel/:id/exemption',
   authorize('authority', 'admin'),
@@ -395,48 +414,74 @@ router.post(
 );
 
 router.post(
+  '/training-sessions',
+  authorize('authority', 'admin'),
+  (req, res) =>
+    handleIntake(req, res, (buffer) => replaceTrainingSessions({ buffer, createdBy: req.session.user.id }))
+);
+
+router.post(
   '/requirements',
   authorize('authority', 'admin'),
   (req, res) => handleIntake(req, res, (buffer) => replaceRequirements({ buffer }))
 );
 
-// Training batches: create (code, random within mandal, <=100) / clear.
+// Training orders (PO/APO separate tables — see TRAINING-ORDERS-ANALYSIS.md).
 router.post(
   '/training-orders/allocate',
   authorize('authority', 'admin'),
   (req, res) => trainingOrders.allocate(req, res),
 );
-
+router.post(
+  '/training-orders/wipe-all-data',
+  authorize('authority', 'admin'),
+  (req, res) => trainingOrders.wipeAllData(req, res),
+);
+router.post(
+  '/training-orders/generate',
+  authorize('authority', 'admin'),
+  (req, res) => trainingOrders.generate(req, res),
+);
+// Legacy alias: print → generate (built-in templates; no upload).
 router.post(
   '/training-orders/print',
   authorize('authority', 'admin'),
-  (req, res) => trainingOrders.printOrder(req, res),
+  (req, res) => trainingOrders.generate(req, res),
 );
-
 router.get(
   '/training-orders',
   authorize('authority', 'admin'),
-  async (req, res) => {
-    try {
-      const { listTrainingOrders } = require('../training-orders/index');
-      const result = await listTrainingOrders({
-        page: req.query.page,
-        perPage: req.query.perPage,
-        group: req.query.group,
-        status: req.query.status,
-      });
-      res.json({ ok: true, ...result });
-    } catch (err) {
-      console.error('list training orders failed:', err);
-      res.status(500).json({ ok: false, error: 'Failed to list training orders' });
-    }
-  }
+  (req, res) => trainingOrders.list(req, res),
 );
-
 router.get(
-  '/training-orders/:id/download',
+  '/training-orders/batches',
+  authorize('staff', 'authority', 'admin'),
+  (req, res) => trainingOrders.batches(req, res),
+);
+router.get(
+  '/training-orders/batches/:id/members',
+  authorize('staff', 'authority', 'admin'),
+  (req, res) => trainingOrders.members(req, res),
+);
+router.get(
+  '/training-orders/batches/:id/locations',
+  authorize('staff', 'authority', 'admin'),
+  (req, res) => trainingOrders.locations(req, res),
+);
+router.patch(
+  '/training-orders/batches/:id/location',
   authorize('authority', 'admin'),
-  (req, res) => trainingOrders.download(req, res),
+  (req, res) => trainingOrders.setLocation(req, res),
+);
+router.get(
+  '/training-orders/download-zip',
+  authorize('authority', 'admin'),
+  (req, res) => trainingOrders.downloadZip(req, res),
+);
+router.get(
+  '/training-orders/:group/:id/download',
+  authorize('authority', 'admin'),
+  (req, res) => trainingOrders.downloadOne(req, res),
 );
 
 router.post(

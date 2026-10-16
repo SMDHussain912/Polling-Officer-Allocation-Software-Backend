@@ -70,7 +70,7 @@ async function replaceTrainingLocations({ buffer }) {
       await client.query(
         `INSERT INTO training_locations (location_name, panchayat, mandal, category)
          VALUES ($1,$2,$3,$4)`,
-        [r.location_name, r.mandal, r.panchayat, r.category]
+        [r.location_name, r.panchayat, r.mandal, r.category]
       );
     }
     await client.query('COMMIT');
@@ -429,10 +429,38 @@ async function getIdCardDesign() {
   }
 }
 
+async function replaceTrainingSessions({ buffer, createdBy }) {
+  const { parseTrainingSessions } = require('./intake');
+  const { accepted, rejected } = parseTrainingSessions(buffer);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM training_sessions');
+    for (const r of accepted) {
+      await client.query(
+        `INSERT INTO training_sessions
+           (district, title, session_type, mandal, venue, scheduled_at,
+            duration_minutes, conducted_by, created_by_user_id, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [r.district, r.title, r.session_type, r.mandal, r.venue, r.scheduled_at,
+         r.duration_minutes, r.conducted_by, createdBy, r.status]
+      );
+    }
+    await client.query('COMMIT');
+    return { totalRows: accepted.length + rejected.length, acceptedRows: accepted.length, rejectedRows: rejected.length, rejected };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 
 module.exports = {
   replaceMicroObservers,
   replaceTrainingLocations,
+  replaceTrainingSessions,
   replaceRequirements,
   createTrainingBatches,
   clearTrainingBatches,

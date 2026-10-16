@@ -1,5 +1,6 @@
 const express = require('express');
 const session = require('express-session');
+const morgan = require('morgan');
 const config = require('./config');
 const authRoutes = require('./modules/auth');
 const importRoutes = require('./modules/imports');
@@ -11,6 +12,23 @@ const reportsRoutes = require('./modules/reports');
 const trainingRoutes = require('./modules/training');
 
 const app = express();
+
+// HTTP request logger (dev: combined-style output; production: same)
+// Shows method, URL, status, response time, content-length for every request.
+app.use(morgan('dev'));
+
+// Debug: log every incoming request body and headers at the route entry point.
+app.use((req, res, next) => {
+  if (process.env.DEBUG_REQUESTS === 'true') {
+    console.debug('[REQ]', req.method, req.originalUrl, {
+      body: req.body,
+      query: req.query,
+      params: req.params,
+      sessionUser: req.session && req.session.user ? req.session.user.id : null,
+    });
+  }
+  next();
+});
 
 // 20mb limit matches the imports router's own intent: uploads are base64-JSON
 // (~1.37x file size). The app-level default (100kb) would 413 any workbook
