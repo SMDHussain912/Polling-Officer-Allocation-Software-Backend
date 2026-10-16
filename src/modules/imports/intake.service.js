@@ -70,7 +70,7 @@ async function replaceTrainingLocations({ buffer }) {
       await client.query(
         `INSERT INTO training_locations (location_name, panchayat, mandal, category)
          VALUES ($1,$2,$3,$4)`,
-        [r.location_name, r.mandal, r.panchayat, r.category]
+        [r.location_name, r.panchayat, r.mandal, r.category]
       );
     }
     await client.query('COMMIT');

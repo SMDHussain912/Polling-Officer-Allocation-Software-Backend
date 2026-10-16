@@ -433,6 +433,11 @@ router.post(
   (req, res) => trainingOrders.allocate(req, res),
 );
 router.post(
+  '/training-orders/wipe-all-data',
+  authorize('authority', 'admin'),
+  (req, res) => trainingOrders.wipeAllData(req, res),
+);
+router.post(
   '/training-orders/generate',
   authorize('authority', 'admin'),
   (req, res) => trainingOrders.generate(req, res),

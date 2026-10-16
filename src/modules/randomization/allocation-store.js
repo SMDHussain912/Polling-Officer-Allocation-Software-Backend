@@ -213,41 +213,36 @@ function recordRun(entry) {
   store.hydrated = true; // we hold the freshest run; no need to hydrate over it
   store.lastRun = entry;
   store.publication = null; // a new run supersedes any earlier publication
-  // Write-through to the DB (fire-and-forget from the router's perspective —
-  // the router awaits this promise before responding).
+  // Write-through to the DB. The router awaits this promise before responding,
+  // so a failure here must surface as an error — never a false success.
   return (async () => {
+    const r = await pool.query(
+      'INSERT INTO allocation_runs' +
+      ' (run_by_id, run_by_username, run_by_role, stage1, stage2, stage3, audit_events)' +
+      ' VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, run_at',
+      [
+        (entry.runBy && entry.runBy.id) || null,
+        (entry.runBy && entry.runBy.username) || null,
+        (entry.runBy && entry.runBy.role) || null,
+        JSON.stringify(entry.stage1 || {}),
+        JSON.stringify(entry.stage2 || {}),
+        JSON.stringify(entry.stage3 || {}),
+        JSON.stringify(entry.auditEvents || []),
+      ]
+    );
+    entry.id = r.rows[0].id;
+    if (!entry.runAt) entry.runAt = r.rows[0].run_at instanceof Date ? r.rows[0].run_at.toISOString() : r.rows[0].run_at;
+    // Normalized Stage 2/3 rows (migration 014): same transaction scope as
+    // the run, so Training can read DB tables instead of re-parsing JSON.
+    // A persist failure is logged and marked on the entry, but does NOT
+    // fail the run — the allocation_runs row and in-memory store are already
+    // committed, so Training can still fall back to the run JSON.
     try {
-      const r = await pool.query(
-        'INSERT INTO allocation_runs' +
-        ' (run_by_id, run_by_username, run_by_role, stage1, stage2, stage3, audit_events)' +
-        ' VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, run_at',
-        [
-          (entry.runBy && entry.runBy.id) || null,
-          (entry.runBy && entry.runBy.username) || null,
-          (entry.runBy && entry.runBy.role) || null,
-          JSON.stringify(entry.stage1 || {}),
-          JSON.stringify(entry.stage2 || {}),
-          JSON.stringify(entry.stage3 || {}),
-          JSON.stringify(entry.auditEvents || []),
-        ]
-      );
-      entry.id = r.rows[0].id;
-      if (!entry.runAt) entry.runAt = r.rows[0].run_at instanceof Date ? r.rows[0].run_at.toISOString() : r.rows[0].run_at;
-      // Normalized Stage 2/3 rows (migration 014): same transaction scope as
-      // the run, so Training can read DB tables instead of re-parsing JSON.
-      // A persist failure must NOT be silent anymore — mark the entry so the
-      // router can report it honestly.
-      try {
-        entry.stageTables = await persistStageTables(entry.id, entry);
-      } catch (stageErr) {
-        entry.stageTablesError = stageErr.message || String(stageErr);
-        if (process.env.NODE_ENV !== 'test') {
-          console.error('allocation-store: stage tables persist FAILED:', stageErr);
-        }
-      }
-    } catch (err) {
+      entry.stageTables = await persistStageTables(entry.id, entry);
+    } catch (stageErr) {
+      entry.stageTablesError = stageErr.message || String(stageErr);
       if (process.env.NODE_ENV !== 'test') {
-        console.warn('allocation-store: DB persist skipped (' + (err.message || err) + ')');
+        console.error('allocation-store: stage tables persist FAILED:', stageErr);
       }
     }
     return store.lastRun;

@@ -4,6 +4,7 @@
 
 const {
   allocateTraining,
+  wipeAllData: wipeAllDataLogic,
   listBatches,
   listBatchMembers,
   listBatchLocations,
@@ -30,6 +31,19 @@ async function allocate(req, res) {
     res.json({ ok: true, ...result });
   } catch (err) {
     sendErr(res, err, 'Allocation failed');
+  }
+}
+
+/** POST /training-orders/wipe-all-data  (wipes all public tables except users/roles) */
+async function wipeAllData(req, res) {
+  try {
+    console.debug('[WIPE-ALL-DATA] called by user', req.session && req.session.user ? req.session.user.id : null);
+    const result = await wipeAllDataLogic();
+    console.debug('[WIPE-ALL-DATA] truncated tables:', result.truncated);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('[WIPE-ALL-DATA] failed:', err);
+    sendErr(res, err, 'Wipe all data failed');
   }
 }
 
@@ -140,6 +154,7 @@ async function downloadZip(req, res) {
 
 module.exports = {
   allocate,
+  wipeAllData,
   generate,
   list,
   batches,

@@ -130,9 +130,35 @@ async function wipeAllTraining(client) {
 }
 
 /**
- * Resolve HR employee_id strings → personnel.id (+ profile fields).
- * Returns Map employee_id -> { id, employee_id, employee_name, ... }.
+ * Wipe every table EXCEPT `users` and `roles` (auth tables must be kept so
+ * admins can still log in). Uses TRUNCATE ... CASCADE so FK-dependent rows
+ * are removed automatically. Returns the list of tables that were truncated.
  */
+async function wipeAllData() {
+  // Keep users/roles (auth) AND randomization source tables — wiping them
+  // destroys allocation_runs / stage2_team_members / stage3_assignments and
+  // makes Training show "No completed randomization run found" after allocate.
+  const protectedTables = new Set([
+    'users',
+    'roles',
+    'allocation_runs',
+    'stage2_team_members',
+    'stage3_assignments',
+  ]);
+  const { rows } = await pool.query(
+    `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`
+  );
+  const toTruncate = rows
+    .map((r) => r.tablename)
+    .filter((name) => !protectedTables.has(name));
+  if (toTruncate.length === 0) return { truncated: [] };
+  const quoted = toTruncate.map((n) => `"${n}"`).join(', ');
+  console.debug("[WIPE-ALL-DATA] truncating tables:", toTruncate);
+  await pool.query(`TRUNCATE TABLE ${quoted} CASCADE`);
+  console.debug("[WIPE-ALL-DATA] truncated", toTruncate.length, "tables");
+  return { truncated: toTruncate };
+}
+
 async function loadPersonnelByEmployeeIds(client, employeeIds) {
   const ids = [...new Set(employeeIds.map((x) => String(x).trim()).filter(Boolean))];
   const map = new Map();
@@ -155,6 +181,7 @@ async function loadPersonnelByEmployeeIds(client, employeeIds) {
  * Allocate: wipe → split Stage-2 rows into PO/APO by duty mandal → batches ≤100.
  */
 async function allocateTraining({ createdBy } = {}) {
+  console.debug("[ALLOCATE] starting allocateTraining, createdBy:", createdBy);
   await hydrateOnce();
 
   // Source priority: normalized Stage 2/3 DB tables (migration 014) first —
@@ -166,6 +193,7 @@ async function allocateTraining({ createdBy } = {}) {
   let stageRunId = null;
   try {
     const tables = await latestStageTables();
+    console.debug('[ALLOCATE] latestStageTables rows:', tables ? tables.rows.length : 0, 'runId:', tables ? tables.runId : null);
     if (tables && tables.rows.length > 0) {
       stageRunId = tables.runId;
       source = 'stage_tables';
@@ -176,6 +204,10 @@ async function allocateTraining({ createdBy } = {}) {
         duty: r.duty,
         employeeId: r.employee_id,
         trainingGroup: r.training_group,
+        // Stage 3 enrichment: officer's real duty station (mandal) + ballot ID
+        // (station / venue code) from the published Stage-3 allotment.
+        dutyMandal: r.station_mandal || '',
+        venueCode: r.station_code || '',
       }));
     }
   } catch (err) {
@@ -186,23 +218,100 @@ async function allocateTraining({ createdBy } = {}) {
   }
   if (teamRows.length === 0) {
     const lastRun = getLastRun();
-    const jsonRows =
-      lastRun && lastRun.stage2 && Array.isArray(lastRun.stage2.excelRows)
-        ? lastRun.stage2.excelRows
-        : [];
+    let jsonRows = [];
+    let jsonSource = 'none';
+    if (lastRun && lastRun.stage2) {
+      // Prefer excelRows (legacy run-JSON format); fall back to parties
+      // (the actual Stage 2 structure the run produces). excelRows never
+      // exists in current code — persistStageTables writes stage2.parties
+      // to the DB instead — so this fallback is what makes Training see
+      // data when migration 014 stage tables are unavailable.
+      if (Array.isArray(lastRun.stage2.excelRows)) {
+        jsonRows = lastRun.stage2.excelRows;
+        jsonSource = 'excelRows';
+      } else if (Array.isArray(lastRun.stage2.parties)) {
+        let partyIdx = 0;
+        for (const p of lastRun.stage2.parties) {
+          const teamCode = `T${String(partyIdx + 1).padStart(3, '0')}`;
+          const mandal = String(p.posting || 'UNSPECIFIED').trim() || 'UNSPECIFIED';
+          for (const m of p.members || []) {
+            jsonRows.push({
+              employeeId: m.personnelId || m.employee_id || null,
+              employee_id: m.personnelId || m.employee_id || null,
+              role: m.role || 'Polling Officer',
+              duty: m.duty || null,
+              teamCode,
+              training_group: classifyRole(m.role),
+              trainingGroup: classifyRole(m.role),
+              mandal,
+              dutyMandal: '',
+              venueCode: '',
+            });
+          }
+          partyIdx += 1;
+        }
+        jsonSource = 'parties';
+      }
+    }
+    console.debug('[ALLOCATE] JSON fallback rows:', jsonRows.length, 'source:', jsonSource);
     if (jsonRows.length > 0) {
       source = 'run_json';
       teamRows = jsonRows;
     }
   }
   if (teamRows.length === 0) {
+    // Diagnostics: what does the DB actually contain? Helps the operator
+    // tell whether (a) no run was ever saved, (b) migrations are missing,
+    // or (c) stage tables exist but are empty.
+    let dbState = null;
+    try {
+      const runs = await pool.query('SELECT COUNT(*)::int AS c FROM allocation_runs');
+      const s2m = await pool.query('SELECT COUNT(*)::int AS c FROM stage2_team_members');
+      const s3a = await pool.query('SELECT COUNT(*)::int AS c FROM stage3_assignments');
+      const lastRun = getLastRun();
+      const jsonExcelRows = lastRun && lastRun.stage2 && Array.isArray(lastRun.stage2.excelRows)
+        ? lastRun.stage2.excelRows.length
+        : (lastRun ? 0 : null);
+      const jsonParties = lastRun && lastRun.stage2 && Array.isArray(lastRun.stage2.parties)
+        ? lastRun.stage2.parties.length
+        : (lastRun ? 0 : null);
+      dbState = {
+        allocationRunsRows: Number(runs.rows[0].c),
+        stage2TeamMembersRows: Number(s2m.rows[0].c),
+        stage3AssignmentsRows: Number(s3a.rows[0].c),
+        inMemoryRun: !!lastRun,
+        inMemoryRunStage2ExcelRows: jsonExcelRows,
+        inMemoryRunStage2Parties: jsonParties,
+      };
+    } catch (diagErr) {
+      dbState = { error: diagErr.message || String(diagErr) };
+    }
+
+    const hints = [];
+    if (source === 'none') {
+      hints.push(
+        'No Stage 2/3 data source was found. Check that migrations 012 (allocation_runs) and 014 (stage results) are applied to the database, then run POST /api/randomization/run.'
+      );
+    } else if (source === 'run_json') {
+      hints.push(
+        'A run exists but its Stage-2 excelRows is empty — re-run POST /api/randomization/run so Stage 2/3 rows persist to the stage tables.'
+      );
+    } else {
+      hints.push(
+        'Stage tables exist but are empty — re-run POST /api/randomization/run so Stage 2/3 rows persist.'
+      );
+    }
     return {
       batches: [],
-      errors: ['No completed randomization run found. Run Stage 2/3 first (POST /api/randomization/run).'],
+      errors: [
+        'No completed randomization run found. Run Stage 2/3 first (POST /api/randomization/run).',
+        ...hints,
+      ],
       skippedMo: 0,
       unresolved: 0,
       source,
       stageRunId,
+      dbState,
     };
   }
 
@@ -263,8 +372,9 @@ async function allocateTraining({ createdBy } = {}) {
             }
             await client.query(
               `INSERT INTO ${t.members}
-                 (batch_id, personnel_id, employee_id, role, team_code, added_by_code)
-               VALUES ($1, $2, $3, $4, $5, TRUE)
+                 (batch_id, personnel_id, employee_id, role, team_code,
+                  duty_mandal, venue_code, added_by_code)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
                ON CONFLICT DO NOTHING`,
               [
                 batchId,
@@ -272,6 +382,8 @@ async function allocateTraining({ createdBy } = {}) {
                 per.employee_id,
                 officer.role || null,
                 officer.teamCode || null,
+                officer.dutyMandal || null,
+                officer.venueCode || null,
               ]
             );
             inserted += 1;
@@ -458,8 +570,13 @@ async function generateOrders({ group, createdBy } = {}) {
 
     const rows = await client.query(
       `SELECT m.personnel_id, m.employee_id, m.role, m.team_code, m.batch_id,
-              b.mandal AS duty_mandal, b.batch_no,
+              b.mandal AS batch_mandal, b.batch_no,
+              -- Stage 3 duty mandal (station_mandal) is the officer's real duty
+              -- mandal; fall back to the batch (Stage-2 posting) mandal when not
+              -- yet allotted. venue_code is the Stage-3 station / ballot ID.
+              COALESCE(m.duty_mandal, b.mandal) AS duty_mandal,
               l.location_name AS venue,
+              m.venue_code AS venue_code,
               p.employee_name, p.designation, p.mobile_no, p.work_mandal,
               ib.department_name
          FROM ${t.members} m
@@ -495,6 +612,7 @@ async function generateOrders({ group, createdBy } = {}) {
         mobile_no: row.mobile_no || '',
         training_venue: row.venue || '',
         duty_mandal: row.duty_mandal || '',
+        venue_code: row.venue_code || '',
         ack_name: row.employee_name || '',
         ack_designation: row.designation || '',
         ack_mobile: row.mobile_no || '',
@@ -511,8 +629,8 @@ async function generateOrders({ group, createdBy } = {}) {
       await client.query(
         `INSERT INTO ${t.orders}
            (order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
-            mandal, venue, status, order_docx, created_by, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'generated',$9,$10,now(),now())`,
+            mandal, venue, venue_code, status, order_docx, created_by, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'generated',$10,$11,now(),now())`,
         [
           orderId,
           sl,
@@ -522,6 +640,7 @@ async function generateOrders({ group, createdBy } = {}) {
           row.employee_name,
           row.duty_mandal,
           row.venue || null,
+          row.venue_code || null,
           docx,
           createdBy == null ? null : createdBy,
         ]
@@ -550,7 +669,7 @@ async function listTrainingOrders({ group, page = 1, perPage = 50 } = {}) {
     const count = await pool.query(`SELECT COUNT(*)::int AS c FROM ${t.orders}`);
     const rows = await pool.query(
       `SELECT id, order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
-              mandal, venue, status, created_at,
+              mandal, venue_code, venue, status, created_at,
               '${g}' AS training_group
          FROM ${t.orders}
         ORDER BY sl_no ASC, id ASC
@@ -690,4 +809,5 @@ module.exports = {
   downloadTrainingOrder,
   buildOrdersZip,
   wipeAllTraining,
+  wipeAllData,
 };
