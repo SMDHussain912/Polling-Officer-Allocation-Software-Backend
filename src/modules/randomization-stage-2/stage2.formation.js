@@ -52,7 +52,7 @@ function partyIsValid(members) {
   return true;
 }
 
-function tryFormOnce(pool, partySize, postings, randomInt, startIndex) {
+function tryFormOnce(pool, partySize, postings, randomInt, startIndex, apoDesignation) {
   const avail = pool.slice();
   shuffleInPlace(avail, randomInt);
   const parties = [];
@@ -61,12 +61,24 @@ function tryFormOnce(pool, partySize, postings, randomInt, startIndex) {
   const targetParties = postings.length > 0 ? postings.length : Number.MAX_SAFE_INTEGER;
   const opoSlots = partySize - 2; // 1 PO + 1 APO + opoSlots OPOs
 
-  // Split pool by gazetted status: PO & APO must be gazetted; OPOs must be non-gazetted.
+  // Role pools:
+  //   PO  = gazetted + presiding-eligible (e.g. Headmaster).
+  //   APO = non-gazetted with the APO designation (School Assistant).
+  //   OPO = non-gazetted, any other designation (e.g. Teacher).
+  const apoDesig = apoDesignation || 'School Assistant';
   const gazettedPool = avail.filter(function (e) {
     return e.gazettedStatus && String(e.gazettedStatus).trim().toLowerCase() === 'gazetted';
   });
   const nonGazettedPool = avail.filter(function (e) {
     return !e.gazettedStatus || String(e.gazettedStatus).trim().toLowerCase() !== 'gazetted';
+  });
+  // APO candidates: non-gazetted carrying the APO designation.
+  const apoPool = nonGazettedPool.filter(function (e) {
+    return String(e.designation || '').trim() === apoDesig;
+  });
+  // OPO candidates: non-gazetted, NOT the APO designation.
+  const opoPool = nonGazettedPool.filter(function (e) {
+    return String(e.designation || '').trim() !== apoDesig;
   });
 
   for (const po of gazettedPool) {
@@ -80,8 +92,8 @@ function tryFormOnce(pool, partySize, postings, randomInt, startIndex) {
     const members = [po];
     const usedOffices = new Set([po.officeKey]);
 
-    // Pick APO from remaining gazetted (not PO).
-    const apoCandidates = gazettedPool.filter(function (e) {
+    // Pick APO from non-gazetted School Assistants (not the PO).
+    const apoCandidates = apoPool.filter(function (e) {
       return !used.has(e.personnelKey) && e.personnelKey !== po.personnelKey;
     });
     shuffleInPlace(apoCandidates, randomInt);
@@ -97,8 +109,8 @@ function tryFormOnce(pool, partySize, postings, randomInt, startIndex) {
     }
     if (!apoFound) continue;
 
-    // Pick OPOs from non-gazetted pool.
-    const opoCandidates = nonGazettedPool.filter(function (e) {
+    // Pick OPOs from non-gazetted, non-APO-designation pool.
+    const opoCandidates = opoPool.filter(function (e) {
       return !used.has(e.personnelKey);
     });
     shuffleInPlace(opoCandidates, randomInt);
@@ -128,18 +140,19 @@ function formParties(pool, opts) {
   const randomInt = checkRandomInt(opts.randomInt);
   const maxAttempts = opts.maxAttempts || 50;
   const partiesRequested = opts.partiesRequested || 0;
+  const apoDesignation = opts.apoDesignation;
 
   let best = { parties: [], unassigned: pool.slice() };
   for (let a = 0; a < maxAttempts; a += 1) {
-    const attempt = tryFormOnce(pool, partySize, postings, randomInt, a);
+    const attempt = tryFormOnce(pool, partySize, postings, randomInt, a, apoDesignation);
     if (attempt.parties.length > best.parties.length) best = attempt;
-    const want = partiesRequested > 0 ? partiesRequested : attempt.parties.length;
     if (partiesRequested > 0 && attempt.parties.length >= partiesRequested) {
       best = attempt;
       break;
     }
+    // When partiesRequested === 0, keep trying all maxAttempts to find the
+    // best (most complete) formation; only stop early when everyone is assigned.
     if (partiesRequested === 0 && attempt.unassigned.length === 0) break;
-    if (want > 0 && best.parties.length >= want) break;
   }
   if (partiesRequested > 0) {
     best.parties = best.parties.slice(0, partiesRequested);
@@ -193,16 +206,16 @@ function electionShortOf(electionConfigurationId) {
 }
 
 function roleForSlot(slotIndex, pollingOfficersPerParty) {
-  // slotIndex 0 = Presiding Officer (gazetted).
-  // slotIndex 1 = Assistant Polling Officer / APO (gazetted).
-  // slotIndex 2+ = OPO / Polling Officer (non-gazetted).
-  // Shortage 1+4: slots are 1st, 2nd, 3rd(merged), 5th — no 4th role.
+  // slotIndex 0 = Presiding Officer (PO, gazetted).
+  // slotIndex 1 = Assistant Polling Officer / APO (NON-gazetted School Assistant).
+  //   The APO carries the 1st polling post duty; OPOs cover the rest.
+  // Shortage 1+4: OPO slots are 1st, 2nd, 3rd(merged) — no 4th/5th role.
   if (slotIndex === 0) return TEAM_ROLES.PRESIDING_OFFICER;
   if (slotIndex === 1) return TEAM_ROLES.ASSISTANT_POLLING_OFFICER;
   if (pollingOfficersPerParty === 4) {
     if (slotIndex === 2) return TEAM_ROLES.POLLING_OFFICER_1;
     if (slotIndex === 3) return TEAM_ROLES.POLLING_OFFICER_2;
-    if (slotIndex === 4) return TEAM_ROLES.POLLING_OFFICER_5;
+    if (slotIndex === 4) return TEAM_ROLES.POLLING_OFFICER_3;
   }
   if (slotIndex === 2) return TEAM_ROLES.POLLING_OFFICER_1;
   if (slotIndex === 3) return TEAM_ROLES.POLLING_OFFICER_2;

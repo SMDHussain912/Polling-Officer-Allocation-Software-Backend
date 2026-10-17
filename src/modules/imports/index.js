@@ -29,7 +29,7 @@ const { requireAuth, authorize } = require('../../middleware/auth');
 const { persistPersonnelImport } = require('./import.service');
 const { ImportParseError } = require('./excel.parser');
 
-const MAX_FILE_BYTES = 15 * 1024 * 1024; // decoded size cap (~15 MB)
+const MAX_FILE_BYTES = 100 * 1024 * 1024; // decoded size cap (~100 MB) for large Excel uploads
 
 const router = express.Router();
 router.use(requireAuth);
@@ -183,10 +183,9 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
   }
 });
 
-// ---- Training: PO / APO separate allocation (work_mandal based) ----
+// ---- Training: PO / APO separate roster tables (work_mandal based) ----
 
-const { requireAuth, authorize } = require('../../middleware/auth');
-const { buildTrainingBatches } = require('./po_apo.allocator');
+const { buildTrainingBatches } = require('../training/po_apo.allocator');
 
 router.get('/training/po-apo-batches', authorize('authority', 'admin'), async (req, res) => {
   try {

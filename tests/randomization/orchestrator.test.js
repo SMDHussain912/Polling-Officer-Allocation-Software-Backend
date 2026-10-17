@@ -13,10 +13,10 @@ const { runAllocation } = require('../../src/modules/randomization/orchestrator'
 function personnel(count, mandal) {
   const rows = [];
   for (let i = 0; i < count; i += 1) {
-    // 3-tier gazetted split matching the new PO/APO/OPO rule:
+    // 3-tier split matching the corrected PO/APO/OPO rule:
     //   i%6===0 -> Headmaster   (Gazetted,     rank 1, PO-eligible)
-    //   i%6===1 -> School Asst  (Gazetted,     rank 3, APO slot)
-    //   else    -> Teacher      (Non-Gazetted, rank 5, OPO slots)
+    //   i%6===1 -> School Asst  (Non-Gazetted, rank 3, APO slot 1)
+    //   else    -> Teacher      (Non-Gazetted, rank 5, OPO slots 2+)
     const mod = i % 6;
     const designation = mod === 0 ? 'Headmaster'
       : mod === 1 ? 'School Assistant' : 'Teacher';
@@ -28,7 +28,7 @@ function personnel(count, mandal) {
       district: 'Kakinada',
       work_mandal: mandal,
       native_mandal: 'Anaparthi',
-      gazetted_status: mod <= 1 ? 'Gazetted' : 'Non-Gazetted',
+      gazetted_status: mod === 0 ? 'Gazetted' : 'Non-Gazetted',
       exempt_category: null,
     });
   }

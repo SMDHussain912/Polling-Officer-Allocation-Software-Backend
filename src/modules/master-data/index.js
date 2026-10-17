@@ -30,7 +30,7 @@ const MAX_STATIONS = 5000;
 
 const router = express.Router();
 router.use(requireAuth);
-router.use(express.json({ limit: '20mb' }));
+router.use(express.json({ limit: '100mb' }));
 
 router.post('/stations', authorize('authority', 'admin'), async (req, res) => {
   const { fileName, stations } = req.body || {};

@@ -16,12 +16,13 @@
  * persists the output to po_training_batches / apo_training_batches.
  */
 
-function classifyRole(gazettedStatus, role) {
-  const gz = String(gazettedStatus || '').trim().toLowerCase();
+function classifyRole(gazettedStatus, role, designation) {
   const r = String(role || '').trim().toLowerCase();
   if (r === 'po' || r === 'presiding officer') return 'PO';
-  if (gz === 'gazetted') return 'APO';
-  // Non-gazetted = OPO (not trained/allocated as PO/APO)
+  if (r === 'apo' || r === 'assistant polling officer') return 'APO';
+  const desig = String(designation || '').trim().toLowerCase();
+  // APO = non-gazetted School Assistant; OPO/MO/others are never trained as PO/APO.
+  if (desig === 'school assistant') return 'APO';
   return null;
 }
 
@@ -42,7 +43,7 @@ function buildTrainingBatches(stage2Parties, venueByMandal) {
   for (const party of stage2Parties || []) {
     const members = party.members || [];
     for (const m of members) {
-      const role = classifyRole(m.gazettedStatus, m.role);
+      const role = classifyRole(m.gazettedStatus, m.role, m.designation);
       if (role === null) continue; // MO / unassigned: skip
 
       const workMandal = m.workMandal || m.nativeMandal || null;

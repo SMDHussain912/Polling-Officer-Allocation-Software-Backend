@@ -135,13 +135,33 @@ router.post('/run', async (req, res) => {
       seed: body.seed,
     });
 
+    // Persist PO/APO rosters (member[0]=PO, member[1]=APO) with FULL
+    // personnel rows (sensitive INCLUDED, GOVERNMENT-ONLY). Tables live at
+    // po_officers / apo_officers (migration 006). Never silent on failure.
+    let poApoRosters = { po: 0, apo: 0, poErrors: null, apoErrors: null };
+    try {
+      const { persistPoApoRosters } = require('./po-apo-store');
+      const runId = (result && result.stage1 && result.stage1.runId) || null;
+      poApoRosters = await persistPoApoRosters({
+        poolTx: pool,
+        parties: (result && result.stage2 && result.stage2.parties) || [],
+        personnelBatchId: personnelBatchId,
+        districtId: districtId,
+        runId: runId,
+      });
+    } catch (poErr) {
+      console.error('po/apo roster persist failed:', poErr);
+      poApoRosters.poErrors = poApoRosters.poErrors || ('persist crashed: ' + poErr.message);
+      poApoRosters.apoErrors = poApoRosters.apoErrors || ('persist crashed: ' + poErr.message);
+    }
+
     recordRun({
       runAt: new Date().toISOString(),
       runBy: { id: req.session.user.id, username: req.session.user.username, role: req.session.user.role },
       ...result,
     });
 
-    res.json({ ok: true, ...result });
+    res.json({ ok: true, ...result, poApoRosters: poApoRosters });
   } catch (err) {
     const status = err && err.statusCode ? err.statusCode : 500;
     const message =

@@ -216,6 +216,7 @@ async function runAllocation(input) {
       options: {
         postingMandals: postingMandals,
         seed: seed !== undefined && seed !== null ? seed : undefined,
+        useReserves: 'include', // include reserves so all personnel are available for team formation
       },
     },
     { randomInt: randomInt }
@@ -266,13 +267,48 @@ async function runAllocation(input) {
   return { stage1: stage1, stage2: stage2WithMo, stage3: stage3, auditEvents: auditEvents };
 }
 
-module.exports = {
-  runAllocation: runAllocation,
-  toInternalPersonnel: toInternalPersonnel,
-  buildEmployees: buildEmployees,
-  buildStations: buildStations,
-  makeSeededRandomInt: makeSeededRandomInt,
-  createMemoryAudit: createMemoryAudit,
-};
+// Stage 2 -> Stage 3 party formation. Used by tests/embedding; the orchestrator
+// keeps its own in-process version of this step.
+async function _formPollingParties(input, deps) {
+  deps = deps || {};
+  const randomInt = deps.randomInt;
+  const formation = require('./stage2.formation');
+  const stage2 = require('./stage2.service');
+  const service = stage2.createStage2Service({ randomInt: randomInt });
+
+  const partySize = PRESIDING_OFFICERS_PER_PARTY + input.options.pollingOfficersPerParty;
+  const result = formation.formParties(input.employees, {
+    partySize: partySize,
+    postings: input.options.postingMandals,
+    randomInt: randomInt,
+    maxAttempts: 50,
+    partiesRequested: input.options.partiesRequested,
+  });
+  const parties = result.parties.map(function (p, i) {
+    const teamCode = formation.buildTeamCode(input.options.teamCodePrefix, input.electionShort, i + 1);
+    const postingMandal = p.posting ? String(p.posting.raw) : null;
+    const members = p.members.map(function (m, idx) {
+      return {
+        role: formation.roleForSlot(idx, input.options.pollingOfficersPerParty),
+        duty: formation.dutyForSlot(idx, input.options.pollingOfficersPerParty),
+        personnelId: m.personnelId, name: m.name, designation: m.designation,
+        officeId: m.officeId, officeName: m.officeName,
+        workMandal: m.workMandal, nativeMandal: m.nativeMandal,
+        gazettedStatus: m.gazettedStatus,
+        seniorityRank: m.seniorityRank, classification: m.classification,
+      };
+    });
+    return {
+      teamCode: teamCode, postingMandal: postingMandal, members: members,
+      teamSize: partySize, shortageParty: input.options.pollingOfficersPerParty === 4,
+      shortageReason: input.options.pollingOfficersPerParty === 4 ? input.options.shortageReason : null,
+      presidingDutyNeedsConfirmation: duties.PRESIDING_DUTY_NEEDS_CONFIRMATION,
+    };
+  });
+  service.verifyInvariants(input.employees, parties, partySize);
+  return { parties: parties };
+}
+
+module.exports = { runAllocation, buildEmployees, buildStations, _formPollingParties };
 
 

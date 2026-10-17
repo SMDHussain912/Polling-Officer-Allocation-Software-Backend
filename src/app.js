@@ -1,4 +1,5 @@
 const express = require('express');
+const app = express();
 const session = require('express-session');
 const config = require('./config');
 const authRoutes = require('./modules/auth');
@@ -10,9 +11,9 @@ const notificationRoutes = require('./modules/notifications');
 const reportsRoutes = require('./modules/reports');
 const trainingRoutes = require('./modules/training');
 
-const app = express();
-
-app.use(express.json());
+// Increased body limit to support large Excel uploads (10k+ personnel rows can be several MB)
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 app.use(
   session({
     secret: config.sessionSecret,
