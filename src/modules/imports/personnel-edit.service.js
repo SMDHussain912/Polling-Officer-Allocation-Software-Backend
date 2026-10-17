@@ -1,8 +1,7 @@
 'use strict';
 
 /**
- * personnel-edit.service.js — admin edit of a personnel record (migration 008
- * added personnel.email for exactly this: emails collected later).
+ * personnel-edit.service.js — admin edit of a personnel record.
  *
  * PATCH /api/imports/personnel/:id   { ...fields }
  *
@@ -21,7 +20,7 @@
 
 const pool = require('../../database');
 
-// Editable columns -> { max, kind }. kind 'text' (trimmed) | 'email' | 'int'.
+// Editable columns -> { max, kind }. kind 'text' (trimmed) | 'int'.
 // Deliberately EXCLUDES: id, import_batch_id, import_status, validation_errors,
 // is_active, exempt_category, employee_id, employee_name, aadhar_number,
 // voter_id, created_at. employee_name/employee_id are identity set at import.
@@ -50,7 +49,6 @@ const EDITABLE = {
   native_constituency_name: { max: 200, kind: 'text' },
   previous_po_duty: { max: 200, kind: 'text' },
   mobile_no: { max: 40, kind: 'text' },
-  email: { max: 254, kind: 'email' },
   service_in_district_4y: { max: 20, kind: 'text' },
   ph_category: { max: 100, kind: 'text' },
   criminal_case_or_eci_orders: { max: 500, kind: 'text' },
@@ -58,8 +56,6 @@ const EDITABLE = {
   eci_ceo_order_details: { max: 1000, kind: 'text' },
   remarks: { max: 1000, kind: 'text' },
 };
-
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function cleanValue(spec, value, field) {
   if (value === null) return null; // explicit clear where column allows
@@ -75,11 +71,6 @@ function cleanValue(spec, value, field) {
   if (trimmed === '') return null;
   if (trimmed.length > spec.max) {
     const err = new Error(field + ' must be at most ' + spec.max + ' characters');
-    err.statusCode = 400;
-    throw err;
-  }
-  if (spec.kind === 'email' && !EMAIL_RE.test(trimmed)) {
-    const err = new Error(field + ' is not a valid email address');
     err.statusCode = 400;
     throw err;
   }

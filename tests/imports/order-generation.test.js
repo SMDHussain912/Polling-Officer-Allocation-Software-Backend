@@ -3,15 +3,14 @@
 /**
  * tests/imports/order-generation.test.js
  *
- * Route-level tests for order generation + email:
+ * Route-level tests for order generation (mail send system removed):
  *   POST /api/imports/order-assignments/:id/generate
- *   POST /api/imports/order-assignments/:id/generate-and-send
+ *   POST /api/imports/order-assignments/:id/generate-and-send  -> 404 (removed)
  *
- * Stubs the DB pool AND the generation/gmail seams so no live template,
- * database, or Gmail call happens. Verifies: auth (401/403), 404 unknown
- * assignment, 409 no template, 200 generate returns base64 docx, and
- * generate-and-send surfaces an honest emailError when there is no email /
- * provider is unconfigured (never a fake success).
+ * Stubs the DB pool AND the generation seam so no live template or database
+ * call happens. Verifies: auth (401/403), 404 unknown assignment, 409 no
+ * template, 200 generate returns base64 docx, and the removed mail route is
+ * gone (fail closed, never a fake success).
  *
  * Run: node --test tests/imports/order-generation.test.js
  */
@@ -35,11 +34,11 @@ function templateBytes() {
 
 // Swap the generation service exports for controllable fakes.
 const realGenerate = genService.generateOrderDocx;
-const realSend = genService.generateAndSend;
+const realGenerateOrder = genService.generateOrder;
 let genImpl = realGenerate;
-let sendImpl = realSend;
+let orderImpl = realGenerateOrder;
 genService.generateOrderDocx = (...a) => genImpl(...a);
-genService.generateAndSend = (...a) => sendImpl(...a);
+genService.generateOrder = (...a) => orderImpl(...a);
 
 function buildApp(user) {
   const app = express();
@@ -69,7 +68,7 @@ const STAFF = { id: 2, username: 'staff1', role: 'staff' };
 
 function restore() {
   genImpl = realGenerate;
-  sendImpl = realSend;
+  orderImpl = realGenerateOrder;
 }
 
 test('generate: unauthenticated -> 401', async () => {
@@ -83,7 +82,7 @@ test('generate: staff -> 403', async () => {
 });
 
 test('generate: 404 when assignment missing', async () => {
-  genImpl = async () => { const e = new Error('assignment not found'); e.statusCode = 404; throw e; };
+  orderImpl = async () => { const e = new Error('assignment not found'); e.statusCode = 404; throw e; };
   const { status, body } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/999/generate');
   assert.equal(status, 404);
   assert.equal(body.ok, false);
@@ -91,7 +90,7 @@ test('generate: 404 when assignment missing', async () => {
 });
 
 test('generate: 409 when no active template', async () => {
-  genImpl = async () => { const e = new Error('no active template uploaded for kind stage_officer_ii'); e.statusCode = 409; throw e; };
+  orderImpl = async () => { const e = new Error('no active template uploaded for kind stage_officer_ii'); e.statusCode = 409; throw e; };
   const { status, body } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/1/generate');
   assert.equal(status, 409);
   assert.match(body.error, /no active template/i);
@@ -99,52 +98,31 @@ test('generate: 409 when no active template', async () => {
 });
 
 test('generate: 200 returns base64 docx + metadata', async () => {
-  genImpl = async () => ({ fileName: 'stage_officer_ii_E1.docx', buffer: templateBytes(), templateKind: 'stage_officer_ii', assignment: { id: 1 } });
+  orderImpl = async () => ({ ok: true, document: { id: 3 }, fileName: 'stage_officer_ii_E1.docx', bytes: templateBytes().length, docxBase64: templateBytes().toString('base64') });
   const { status, body } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/1/generate');
   assert.equal(status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.fileName, 'stage_officer_ii_E1.docx');
   assert.ok(body.bytes > 0);
   assert.ok(typeof body.docxBase64 === 'string' && body.docxBase64.length > 0);
+  assert.equal(body.emailed, undefined, 'mail system removed: no emailed flag');
   restore();
 });
 
-test('generate-and-send: staff -> 403', async () => {
-  const { status } = await request(buildApp(STAFF), 'POST', '/api/imports/order-assignments/1/generate-and-send');
-  assert.equal(status, 403);
-});
-
-test('generate-and-send: honest emailError when no email on file (emailed=false)', async () => {
-  sendImpl = async () => ({ ok: true, document: { id: 5 }, fileName: 'x.docx', bytes: 10, emailed: false, emailError: 'personnel has no email on file' });
-  const { status, body } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/1/generate-and-send');
-  assert.equal(status, 200);
-  assert.equal(body.emailed, false);
-  assert.match(body.emailError, /no email on file/i);
-  restore();
-});
-
-test('generate-and-send: honest emailError when provider unconfigured', async () => {
-  sendImpl = async () => ({ ok: true, document: { id: 6 }, fileName: 'x.docx', bytes: 10, emailed: false, emailError: 'email provider not configured (GMAIL_* env missing)' });
-  const { status, body } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/1/generate-and-send');
-  assert.equal(status, 200);
-  assert.equal(body.emailed, false);
-  assert.match(body.emailError, /not configured/i);
-  restore();
-});
-
-test('generate-and-send: emailed=true with providerMessageId on success', async () => {
-  sendImpl = async () => ({ ok: true, document: { id: 7 }, fileName: 'x.docx', bytes: 10, emailed: true, providerMessageId: 'gm-123', email: 'a@b.c' });
-  const { status, body } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/1/generate-and-send');
-  assert.equal(status, 200);
-  assert.equal(body.emailed, true);
-  assert.equal(body.providerMessageId, 'gm-123');
-  restore();
-});
-
-test('generate-and-send: 500 surfaces a service throw', async () => {
-  sendImpl = async () => { throw new Error('boom'); };
-  const { status, body } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/1/generate-and-send');
+test('generate: 500 surfaces a service throw', async () => {
+  orderImpl = async () => { throw new Error('boom'); };
+  const { status, body } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/1/generate');
   assert.equal(status, 500);
   assert.equal(body.ok, false);
   restore();
+});
+
+test('generate-and-send route was removed (mail system gone) -> 404', async () => {
+  const { status } = await request(buildApp(AUTHORITY), 'POST', '/api/imports/order-assignments/1/generate-and-send');
+  assert.equal(status, 404, 'removed mail route must not exist');
+});
+
+test('service no longer exports generateAndSend', () => {
+  assert.equal(genService.generateAndSend, undefined, 'generateAndSend removed with the mail system');
+  assert.equal(typeof genService.generateOrder, 'function', 'generateOrder is the replacement');
 });

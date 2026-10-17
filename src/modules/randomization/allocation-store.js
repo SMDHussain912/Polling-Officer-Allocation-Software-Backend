@@ -66,12 +66,20 @@ async function hydrateOnce() {
   }
 }
 
+/**
+ * Classify Stage-2 role → training group for the roster snapshot.
+ * Team rework: APO = the single Assistant Presiding Officer (4th Polling
+ * Officer slot, former ZPTC officer); OPO = the other four polling officers
+ * (1st/2nd/3rd/5th — Voter ID, Ink, MPTC, Incharge); MO = Micro Observer.
+ */
 function classifyStage2Role(role) {
-  const r = String(role || '').toLowerCase();
+  const r = String(role || '').toLowerCase().trim();
   if (r.includes('micro') && r.includes('observer')) return 'MO';
   if (r === 'mo' || r.startsWith('micro observer')) return 'MO';
+  if (/\b4th\b|\bfourth\b/.test(r)) return 'APO';
+  if (r.includes('assistant') || r.includes('asst')) return 'APO';
   if (r.includes('presid')) return 'PO';
-  return 'APO';
+  return 'OPO';
 }
 
 /**
@@ -89,26 +97,12 @@ async function persistStageTables(runId, result) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('DELETE FROM stage3_assignments WHERE run_id = $1', [runId]);
-    await client.query('DELETE FROM stage2_team_members WHERE run_id = $1', [runId]);
-    await client.query('DELETE FROM stage2_teams WHERE run_id = $1', [runId]);
+    await client.query('DELETE FROM team_roster_members WHERE run_id = $1', [runId]);
+    await client.query('DELETE FROM team_rosters WHERE run_id = $1', [runId]);
 
-    const teamIdByCode = new Map();
-    for (const p of parties) {
-      const code = String(p.teamCode || '').trim();
-      if (!code) continue;
-      const r = await client.query(
-        `INSERT INTO stage2_teams (run_id, team_code, posting_mandal, team_size)
-         VALUES ($1,$2,$3,$4)
-         ON CONFLICT (run_id, team_code) DO UPDATE
-           SET posting_mandal = EXCLUDED.posting_mandal, team_size = EXCLUDED.team_size
-         RETURNING id`,
-        [runId, code, p.postingMandal || null, p.teamSize || (p.members ? p.members.length : null)]
-      );
-      teamIdByCode.set(code, r.rows[0].id);
-    }
-
-    // Resolve HR employee_id -> personnel.id once for FK linkage.
+    // Resolve HR employee_id -> personnel.id once for FK linkage; roster
+    // snapshot also freezes the officer's print details (name/designation/
+    // mobile/mandals) so orders do not re-join live HR later.
     const empIds = [];
     for (const p of parties) {
       for (const m of p.members || []) {
@@ -117,64 +111,110 @@ async function persistStageTables(runId, result) {
     }
     const uniqEmp = [...new Set(empIds.filter(Boolean))];
     const idByEmp = new Map();
+    const detailByEmp = new Map();
     if (uniqEmp.length > 0) {
       const pr = await client.query(
-        'SELECT id, employee_id FROM personnel WHERE employee_id = ANY($1::text[])',
+        `SELECT p.id, p.employee_id, p.employee_name, p.designation, p.mobile_no,
+                p.work_mandal, p.native_mandal, ib.department_name
+           FROM personnel p
+           LEFT JOIN import_batches ib ON ib.id = p.import_batch_id
+          WHERE p.employee_id = ANY($1::text[])`,
         [uniqEmp]
       );
-      for (const row of pr.rows) idByEmp.set(String(row.employee_id).trim(), row.id);
+      for (const row of pr.rows) {
+        const key = String(row.employee_id).trim();
+        idByEmp.set(key, row.id);
+        detailByEmp.set(key, row);
+      }
     }
 
+    // --- Frozen team roster snapshot (migration 016) -----------------------
+    // Header row per team: posting mandal + team size + Stage-3 allotment.
+    // Member row per officer: name/designation/mobile/mandals frozen at run
+    // time so training-order printing never re-joins live HR.
+    const assignByTeam = new Map();
+    for (const a of assignments) {
+      const code = String(a.teamCode || '').trim();
+      if (code) assignByTeam.set(code, a);
+    }
     for (const p of parties) {
       const code = String(p.teamCode || '').trim();
       if (!code) continue;
-      const teamId = teamIdByCode.get(code);
+      const a = assignByTeam.get(code) || {};
+      const moMember = (p.members || []).find((m) => classifyStage2Role(m.role) === 'MO');
+      await client.query(
+        `INSERT INTO team_rosters
+           (run_id, team_code, posting_mandal, team_size, operational_size,
+            micro_observer_personnel_id, station_id, station_code, station_mandal,
+            publication_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT (run_id, team_code) DO UPDATE
+           SET posting_mandal = EXCLUDED.posting_mandal, team_size = EXCLUDED.team_size,
+               operational_size = EXCLUDED.operational_size,
+               micro_observer_personnel_id = EXCLUDED.micro_observer_personnel_id,
+               station_id = EXCLUDED.station_id, station_code = EXCLUDED.station_code,
+               station_mandal = EXCLUDED.station_mandal,
+               publication_status = EXCLUDED.publication_status`,
+        [
+          runId, code,
+          p.postingMandal || null,
+          p.teamSize || (p.members ? p.members.length : null),
+          p.operationalSize || null,
+          moMember && moMember.personnelId != null ? String(moMember.personnelId) : null,
+          a.stationId == null ? null : String(a.stationId),
+          a.stationCode == null ? null : String(a.stationCode),
+          a.stationMandal || null,
+          a.publicationStatus || 'confidential',
+        ]
+      );
       for (const m of p.members || []) {
         const empKey = m.personnelId == null ? '' : String(m.personnelId).trim();
         if (!empKey) continue;
+        const d = detailByEmp.get(empKey) || {};
+        const group = classifyStage2Role(m.role);
         await client.query(
-          `INSERT INTO stage2_team_members
-             (run_id, team_id, team_code, employee_id, personnel_id, role, duty, training_group)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          `INSERT INTO team_roster_members
+             (run_id, team_code, employee_id, personnel_id, name, designation,
+              department_name, mobile_no, work_mandal, native_mandal, role, duty,
+              training_group, is_micro_observer, duty_mandal, venue_code)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
            ON CONFLICT (run_id, team_code, employee_id) DO UPDATE
-             SET personnel_id = EXCLUDED.personnel_id, role = EXCLUDED.role,
-                 duty = EXCLUDED.duty, training_group = EXCLUDED.training_group`,
+             SET personnel_id = EXCLUDED.personnel_id, name = EXCLUDED.name,
+                 designation = EXCLUDED.designation,
+                 department_name = EXCLUDED.department_name,
+                 mobile_no = EXCLUDED.mobile_no, work_mandal = EXCLUDED.work_mandal,
+                 native_mandal = EXCLUDED.native_mandal, role = EXCLUDED.role,
+                 duty = EXCLUDED.duty, training_group = EXCLUDED.training_group,
+                 is_micro_observer = EXCLUDED.is_micro_observer,
+                 duty_mandal = EXCLUDED.duty_mandal, venue_code = EXCLUDED.venue_code`,
           [
-            runId, teamId, code, empKey,
+            runId, code, empKey,
             idByEmp.get(empKey) || null,
+            m.name || d.employee_name || null,
+            m.designation || d.designation || null,
+            d.department_name || null,
+            d.mobile_no || null,
+            m.workMandal || d.work_mandal || null,
+            m.nativeMandal || d.native_mandal || null,
             m.role || 'Polling Officer',
             m.duty == null ? null : String(m.duty),
-            classifyStage2Role(m.role),
+            group,
+            group === 'MO',
+            a.stationMandal || null,
+            a.stationCode == null ? null : String(a.stationCode),
           ]
         );
       }
     }
 
-    for (const a of assignments) {
-      const code = String(a.teamCode || '').trim();
-      if (!code) continue;
-      await client.query(
-        `INSERT INTO stage3_assignments
-           (run_id, team_code, station_id, station_code, station_mandal, posting_mandal, publication_status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT (run_id, team_code) DO UPDATE
-           SET station_id = EXCLUDED.station_id, station_code = EXCLUDED.station_code,
-               station_mandal = EXCLUDED.station_mandal, posting_mandal = EXCLUDED.posting_mandal,
-               publication_status = EXCLUDED.publication_status`,
-        [
-          runId, code,
-          a.stationId == null ? null : String(a.stationId),
-          a.stationCode == null ? null : String(a.stationCode),
-          a.stationMandal || null,
-          a.postingMandal || null,
-          a.publicationStatus || 'confidential',
-        ]
-      );
-    }
-
     await client.query('COMMIT');
+    let teamCount = 0;
+    try {
+      const c = await client.query('SELECT COUNT(*)::int AS c FROM team_rosters WHERE run_id = $1', [runId]);
+      teamCount = c.rows[0].c;
+    } catch (_) { /* best-effort count */ }
     return {
-      teams: teamIdByCode.size,
+      teams: teamCount,
       members: uniqEmp.length,
       assignments: assignments.length,
     };
@@ -192,21 +232,26 @@ async function persistStageTables(runId, result) {
  * to allocation_runs JSON).
  */
 async function latestStageTables() {
+  // Frozen roster (migration 016) is the SINGLE source for Stage 2/3 rows:
+  // it carries the officer's print details (name/designation/mobile/mandals)
+  // captured at run time, so training allocation + order printing never
+  // depend on live HR rows. Returns null when no run has persisted rows yet
+  // (caller falls back to allocation_runs JSON).
   const r = await pool.query(
     `SELECT m.run_id, m.team_code, m.employee_id, m.personnel_id, m.role, m.duty,
-            m.training_group,
-            COALESCE(t.posting_mandal, a.posting_mandal) AS mandal,
-            a.station_id, a.station_code, a.station_mandal, a.publication_status
-       FROM stage2_team_members m
-       JOIN (SELECT run_id, MAX(id) AS max_id FROM stage2_team_members GROUP BY run_id
-             ORDER BY run_id DESC LIMIT 1) latest ON latest.run_id = m.run_id
-       LEFT JOIN stage2_teams t ON t.run_id = m.run_id AND t.team_code = m.team_code
-       LEFT JOIN stage3_assignments a ON a.run_id = m.run_id AND a.team_code = m.team_code
-      WHERE m.run_id = latest.run_id
+            m.training_group, m.name, m.designation, m.department_name,
+            m.mobile_no, m.work_mandal, m.native_mandal,
+            COALESCE(m.duty_mandal, tr.posting_mandal) AS mandal,
+            m.duty_mandal, m.venue_code,
+            tr.station_id, tr.station_code, tr.station_mandal, tr.publication_status
+       FROM team_roster_members m
+       JOIN (SELECT MAX(run_id) AS run_id FROM team_roster_members) latest
+         ON latest.run_id = m.run_id
+       JOIN team_rosters tr ON tr.run_id = m.run_id AND tr.team_code = m.team_code
       ORDER BY m.team_code, m.role`
   );
   if (r.rows.length === 0) return null;
-  return { runId: r.rows[0].run_id, rows: r.rows };
+  return { runId: r.rows[0].run_id, rows: r.rows, source: 'team_rosters' };
 }
 
 function recordRun(entry) {
@@ -214,22 +259,43 @@ function recordRun(entry) {
   store.lastRun = entry;
   store.publication = null; // a new run supersedes any earlier publication
   // Write-through to the DB. The router awaits this promise before responding,
-  // so a failure here must surface as an error — never a false success.
+  // so an allocation_runs insert failure must surface as a real error —
+  // NEVER a false success with runId: null (that left Training pointing at
+  // an in-memory-only run and empty stage tables after a restart).
   return (async () => {
-    const r = await pool.query(
-      'INSERT INTO allocation_runs' +
-      ' (run_by_id, run_by_username, run_by_role, stage1, stage2, stage3, audit_events)' +
-      ' VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, run_at',
-      [
-        (entry.runBy && entry.runBy.id) || null,
-        (entry.runBy && entry.runBy.username) || null,
-        (entry.runBy && entry.runBy.role) || null,
-        JSON.stringify(entry.stage1 || {}),
-        JSON.stringify(entry.stage2 || {}),
-        JSON.stringify(entry.stage3 || {}),
-        JSON.stringify(entry.auditEvents || []),
-      ]
-    );
+    let r;
+    try {
+      r = await pool.query(
+        'INSERT INTO allocation_runs' +
+        ' (run_by_id, run_by_username, run_by_role, stage1, stage2, stage3, audit_events)' +
+        ' VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, run_at',
+        [
+          (entry.runBy && entry.runBy.id) || null,
+          (entry.runBy && entry.runBy.username) || null,
+          (entry.runBy && entry.runBy.role) || null,
+          JSON.stringify(entry.stage1 || {}),
+          JSON.stringify(entry.stage2 || {}),
+          JSON.stringify(entry.stage3 || {}),
+          JSON.stringify(entry.auditEvents || []),
+        ]
+      );
+    } catch (err) {
+      const msg = 'allocation_runs insert FAILED: ' + (err.message || String(err));
+      if (process.env.NODE_ENV !== 'test') console.error(msg, err);
+      entry.saveError = msg;
+      const e = new Error(msg);
+      e.statusCode = 500;
+      e.cause = err;
+      throw e;
+    }
+    if (!r || !r.rows || r.rows.length === 0 || r.rows[0].id == null) {
+      const msg = 'allocation_runs insert returned no id — run was NOT saved';
+      if (process.env.NODE_ENV !== 'test') console.error(msg);
+      entry.saveError = msg;
+      const e = new Error(msg);
+      e.statusCode = 500;
+      throw e;
+    }
     entry.id = r.rows[0].id;
     if (!entry.runAt) entry.runAt = r.rows[0].run_at instanceof Date ? r.rows[0].run_at.toISOString() : r.rows[0].run_at;
     // Normalized Stage 2/3 rows (migration 014): same transaction scope as

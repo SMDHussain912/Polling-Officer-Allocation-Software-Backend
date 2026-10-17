@@ -1,9 +1,13 @@
 'use strict';
 
 /**
- * Stage 2 — team-level 20% substitutes (team decision 2026-10-14).
- * Each formed team of size N gets ceil(N x 20%) substitutes from the
- * leftover pool (e.g. 6 -> 2, 5 -> 1). Shortfall is reported, never silent.
+ * Stage 2 — teams contain NO substitutes (substitutes feature removed).
+ *
+ * Earlier releases appended ceil(teamSize x 20%) substitutes per team and
+ * reported SUBSTITUTES_SHORT on shortfall. The feature was removed: a team is
+ * exactly its operational officers (6, or 5 for a shortage party) + one
+ * Micro Observer, and every leftover officer stays visible in `unassigned`
+ * (never silently consumed as a substitute).
  *
  * Run: node --test tests/randomization/stage2-substitutes.test.js
  */
@@ -44,16 +48,20 @@ function stage1Run() {
   };
 }
 
-// Stage 2 now always appends one Micro Observer per party (operational +
-// MO = 7 for a full party), so 20% = ceil(7 x 20%) = 2 substitutes and the
-// fixture needs 6 operational + 1 MO + 2 substitutes = 9 employees.
 const SUB_DESIGNATION_RULES = {
   'Senior Assistant': { microObserverEligible: true },
   'Junior Assistant': { microObserverEligible: true },
 };
 
-test('team of 6 + MO gets ceil(7x20%)=2 substitutes from leftover', () => {
-  // 6 operational + 1 MO-eligible + 2 leftover for substitutes; distinct offices/mandals.
+/** Assert a party carries NO substitute fields (feature removed). */
+function assertNoSubstitutes(party) {
+  assert.equal(party.substitutes, undefined, party.teamCode + ': substitutes array must not exist');
+  assert.equal(party.substitutesRequired, undefined, party.teamCode + ': substitutesRequired must not exist');
+}
+
+test('team of 6 + MO: no substitutes; leftovers stay visible in unassigned', () => {
+  // 9 employees: 6 operational + 1 MO-eligible + 2 leftovers that earlier code
+  // would have consumed as 20% substitutes.
   const employees = [];
   employees.push(employee(1, 'OFF-PO', { seniorityRank: 1, presidingEligible: true }));
   for (let i = 2; i <= 9; i += 1) {
@@ -73,36 +81,25 @@ test('team of 6 + MO gets ceil(7x20%)=2 substitutes from leftover', () => {
   );
   assert.equal(out.parties.length, 1);
   const party = out.parties[0];
+  assertNoSubstitutes(party);
   assert.equal(party.operationalSize, 6, 'operational members stay 6');
   assert.equal(party.members.length, 7, 'members = 6 operational + 1 MO');
-  assert.equal(party.substitutesRequired, 2);
-  assert.equal(party.substitutes.length, 2);
-  assert.equal(out.substituteCount, 2);
+  assert.equal(out.substituteCount, undefined, 'run-level substituteCount removed');
   assert.equal(out.microObserversAssigned, 1);
-  // Substitutes are consumed: not double-counted in unassigned.
-  const subIds = party.substitutes.map((s) => s.personnelId);
-  const unIds = out.unassigned.map((u) => u.personnelId);
-  for (const id of subIds) {
-    assert.ok(!unIds.includes(id), 'substitute ' + id + ' must not be in unassigned');
-    assert.equal(out.parties[0].substitutes.find((s) => s.personnelId === id).substituteFor, party.teamCode);
-  }
+  // The 2 leftover officers were NOT consumed - they remain unassigned.
+  const teamIds = new Set(party.members.map((m) => m.personnelId));
+  const leftovers = out.unassigned.map((u) => u.personnelId).filter((id) => !teamIds.has(id));
+  assert.equal(leftovers.length, 2, 'both leftover officers stay in unassigned, got ' + leftovers.length);
 });
 
-test('separate MO pool: bank-staff MOs assigned, substitutes stay officer-only', () => {
-  // 6 officers + 2 leftover officers for substitutes + 1 bank-staff MO.
-  // Legacy math would eat an officer as MO; separate-pool mode must use the
-  // bank candidate for the MO slot and keep both leftover officers as subs.
+test('separate MO pool: bank-staff MO assigned, no substitute rows', () => {
+  // 6 officers + 2 leftover officers + 1 bank-staff MO. Earlier code kept the
+  // leftovers as officer-only substitutes; now they simply stay unassigned.
   const employees = [];
   employees.push(employee(1, 'OFF-PO', { seniorityRank: 1, presidingEligible: true }));
   for (let i = 2; i <= 8; i += 1) {
     employees.push(employee(i, 'OFF-' + i));
   }
-  const moCandidates = [
-    {
-      personnelId: 'BANK-001', name: 'Bank Officer 1', designation: 'Assistant Manager',
-      officeId: 'BANK-APGB', officeName: 'APGB Amadagur', workMandal: 'W-MO', nativeMandal: 'N-MO',
-    },
-  ];
   const out = formPollingParties(
     {
       stage1Run: stage1Run(),
@@ -110,65 +107,30 @@ test('separate MO pool: bank-staff MOs assigned, substitutes stay officer-only',
       options: {
         partiesRequested: 1,
         postingMandals: ['M-POST'],
-        designationRules: {},
-        moCandidates: moCandidates,
+        designationRules: SUB_DESIGNATION_RULES,
+        moCandidates: [
+          { personnelId: 'BANK-001', name: 'Bank MO', designation: 'Clerk', officeId: 'BANK', officeName: 'Bank', workMandal: 'BW', nativeMandal: 'BN' },
+        ],
       },
     },
     { randomInt: () => 0 }
   );
   assert.equal(out.parties.length, 1);
   const party = out.parties[0];
-  const mos = party.members.filter((m) => m.isMicroObserver === true);
-  assert.equal(mos.length, 1, 'exactly one MO must be attached');
-  assert.equal(mos[0].personnelId, 'BANK-001', 'MO must come from the bank list, not officers');
-  assert.equal(mos[0].name, 'Bank Officer 1');
-  // No officer was consumed as MO: all 8 officers are operational/subs/unassigned.
-  const opIds = party.members.filter((m) => !m.isMicroObserver).map((m) => m.personnelId);
-  assert.equal(opIds.length, 6, 'operational members stay 6');
-  // Substitutes are officer-only: both leftover officers, never the MO.
-  assert.equal(party.substitutes.length, 2);
-  for (const s of party.substitutes) {
-    assert.ok(s.personnelId !== 'BANK-001', 'substitute must never be the MO candidate');
-    assert.ok(String(s.personnelId).startsWith('EMP-'), 'substitute must be an officer, got ' + s.personnelId);
-  }
+  assertNoSubstitutes(party);
+  assert.equal(party.members.length, 7, 'members = 6 operational + 1 MO');
+  const mo = party.members.find((m) => m.isMicroObserver);
+  assert.ok(mo, 'MO assigned');
+  assert.equal(mo.personnelId, 'BANK-001', 'MO comes from the bank-staff pool');
+  const teamIds = new Set(party.members.map((m) => m.personnelId));
+  const leftovers = out.unassigned.map((u) => u.personnelId).filter((id) => !teamIds.has(id));
+  assert.equal(leftovers.length, 2, 'leftover officers stay unassigned, got ' + leftovers.length);
   assert.equal(out.microObserversAssigned, 1);
-  assert.equal(out.status, 'completed');
 });
 
-test('separate MO pool: medical MO candidate is never assigned', () => {
-  // Even if a medical designation slips into the candidate list, the officer
-  // pipeline's HARD reject at upload is the first gate; here we assert the
-  // MO entry that matches a medical designation string is still placeable
-  // only as a normal candidate — the upload gate is what blocks it.
-  // (Upload-level test lives in tests/imports/mo-intake.test.js.)
-  const employees = [];
-  employees.push(employee(1, 'OFF-PO', { seniorityRank: 1, presidingEligible: true }));
-  for (let i = 2; i <= 8; i += 1) {
-    employees.push(employee(i, 'OFF-' + i));
-  }
-  const out = formPollingParties(
-    {
-      stage1Run: stage1Run(),
-      employees: employees,
-      options: {
-        partiesRequested: 1,
-        postingMandals: ['M-POST'],
-        designationRules: {},
-        moCandidates: [
-          {
-            personnelId: 'BANK-002', name: 'Bank Officer 2', designation: 'Clerk',
-            officeId: 'BANK-SBI', officeName: 'SBI', workMandal: 'W-MO2', nativeMandal: 'N-MO2',
-          },
-        ],
-      },
-    },
-    { randomInt: () => 0 }
-  );
-  assert.equal(out.parties[0].members.filter((m) => m.isMicroObserver).length, 1);
-});
-
-test('substitute shortfall forces INCOMPLETE with SUBSTITUTES_SHORT', () => {
-  // Exactly 7 employees: team (6) + MO (1), zero leftover for substitutes.
+test('zero leftover: no SUBSTITUTES_SHORT requirement', () => {
+  // Exactly 7 employees: team (6) + MO (1). Earlier code failed this closed
+  // with SUBSTITUTES_SHORT; with substitutes removed there is nothing short.
   const employees = [];
   employees.push(employee(1, 'OFF-PO', { seniorityRank: 1, presidingEligible: true }));
   for (let i = 2; i <= 7; i += 1) {
@@ -187,18 +149,17 @@ test('substitute shortfall forces INCOMPLETE with SUBSTITUTES_SHORT', () => {
     { randomInt: () => 0 }
   );
   assert.equal(out.parties.length, 1);
-  assert.equal(out.parties[0].substitutes.length, 0);
-  assert.equal(out.status, 'incomplete');
+  assertNoSubstitutes(out.parties[0]);
   assert.ok(
-    out.unmetRequirements.some((r) => r.code === 'SUBSTITUTES_SHORT'),
-    'shortfall must be reported, got: ' + JSON.stringify(out.unmetRequirements)
+    !out.unmetRequirements.some((r) => r.code === 'SUBSTITUTES_SHORT'),
+    'SUBSTITUTES_SHORT was removed with the substitutes feature, got: ' + JSON.stringify(out.unmetRequirements)
   );
+  assert.equal(out.microObserversAssigned, 1);
 });
 
-test('shortage-fallback parties also get 20% substitutes + one MO', () => {
-  // Two 1+4 shortage parties = 10 operational + 2 MOs, + 3 leftover so the
-  // first party can still fill some backup slots while the second reports
-  // SUBSTITUTES_SHORT (fail closed, never silently left short).
+test('shortage-fallback parties: no substitutes, MO outcome explicit', () => {
+  // Two 1+4 shortage parties = 10 operational + 2 MOs from 15 employees; the
+  // 3 extra officers stay unassigned (earlier code burned them as substitutes).
   const employees = [];
   employees.push(employee(1, 'OFF-PO', { seniorityRank: 1, presidingEligible: true }));
   employees.push(employee(2, 'OFF-PO2', { seniorityRank: 2, presidingEligible: true }));
@@ -221,26 +182,24 @@ test('shortage-fallback parties also get 20% substitutes + one MO', () => {
   );
   assert.equal(out.parties.length, 2);
   for (const party of out.parties) {
-    assert.ok(typeof party.substitutesRequired === 'number', 'substitutesRequired is set on shortage teams too');
-    // Shortage 1+4 teams carry 5 operational members; ceil(5x20%) = 1. When an
-    // MO appends, substitute math counts the whole team (1+4 + MO = 6 ->
-    // ceil(6x20%) = 2). Either value is per-team ceil(20%), never silent.
-    assert.ok(
-      party.substitutesRequired === 1 || party.substitutesRequired === 2,
-      'substitutesRequired is ceil(20% of team size), got ' + party.substitutesRequired
-    );
+    assertNoSubstitutes(party);
     const mos = party.members.filter(function (m) { return m.isMicroObserver === true; });
     assert.ok(mos.length <= 1, party.teamCode + ' carries at most one MO');
   }
   const moTeams = out.parties.filter(function (p) {
     return p.members.some(function (m) { return m.isMicroObserver === true; });
   });
-  assert.equal(moTeams.length + out.unmetRequirements.filter(function (u) { return u.code === 'MICRO_OBSERVER_NOT_ASSIGNED'; }).length, 2,
-    'MO outcome is explicit per team: placed OR reported, never silent');
-  assert.equal(out.microObserversAssigned, moTeams.length);
-  assert.ok(
-    out.unmetRequirements.some(function (r) { return r.code === 'SUBSTITUTES_SHORT' || r.code === 'MICRO_OBSERVER_NOT_ASSIGNED'; }),
-    'partial coverage on the second team must be reported (SUBSTITUTES_SHORT or MICRO_OBSERVER_NOT_ASSIGNED), got: ' + JSON.stringify(out.unmetRequirements)
+  assert.equal(
+    moTeams.length + out.unmetRequirements.filter(function (u) { return u.code === 'MICRO_OBSERVER_NOT_ASSIGNED'; }).length,
+    2,
+    'MO outcome is explicit per team: placed OR reported, never silent'
   );
-  assert.equal(out.status, 'incomplete');
+  assert.equal(out.microObserversAssigned, moTeams.length);
+  if (out.status === 'incomplete') {
+    assert.ok(out.unmetRequirements.length > 0, 'incomplete status must carry unmetRequirements');
+    assert.ok(
+      !out.unmetRequirements.some((r) => r.code === 'SUBSTITUTES_SHORT'),
+      'SUBSTITUTES_SHORT was removed with the substitutes feature'
+    );
+  }
 });

@@ -21,7 +21,7 @@
 const express = require('express');
 const pool = require('../../database');
 const { requireAuth, authorize } = require('../../middleware/auth');
-const { getLastRun, getPublication, hydrateOnce } = require('../randomization/allocation-store');
+const { getLastRun, getPublication, hydrateOnce, latestStageTables } = require('../randomization/allocation-store');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -33,13 +33,68 @@ router.get('/allocation', authorize('authority', 'admin'), async (req, res) => {
   if (!last) {
     return res.json({ ok: true, run: null, note: 'No allocation run yet in this session of the server.' });
   }
-  const parties = (last.stage2 && last.stage2.parties) || [];
-  const assignments = (last.stage3 && last.stage3.assignments) || [];
+
+  // --- Officer-level view: frozen Stage-3 roster (migration 016) -----------
+  // The roster is the single source of truth for Stage 2/3 rows: it carries
+  // the officer's print details (employee_id, designation, mobile, mandals)
+  // captured at run time, plus the Stage-3 station verdict (station_id =
+  // BOOTH id / ballot, station_code = venue code, station_mandal).
+  let roster = null;
+  try {
+    roster = await latestStageTables();
+  } catch (err) {
+    // Fall through to the JSON-based allocation view below.
+    console.warn('reports: latestStageTables failed, falling back to JSON allocation', err.message);
+  }
+
+  let parties = [];
+  let assignments = [];
+  let personnelByTeam = new Map();
+
+  if (roster) {
+    // Build per-team officer lists with the full officer print profile.
+    personnelByTeam = new Map();
+    for (const m of roster.rows) {
+      const team = personnelByTeam.get(m.team_code) || [];
+      team.push({
+        employeeId: m.employee_id || null,
+        name: m.name || null,
+        role: m.role || null,
+        designation: m.designation || null,
+        isMicroObserver: Boolean(m.is_micro_observer),
+        venueCode: m.venue_code || null,   // Stage-3 station = polling venue (ballot ID)
+        dutyMandal: m.duty_mandal || null, // officer's duty station mandal
+      });
+      personnelByTeam.set(m.team_code, team);
+    }
+
+    // Assignments keyed by teamCode; supply the ballot/station verdict.
+    const byTeam = new Map();
+    for (const a of (last.stage3 && last.stage3.assignments) || []) {
+      byTeam.set(String(a.teamCode || '').trim(), a);
+    }
+    for (const [teamCode, members] of personnelByTeam) {
+      const a = byTeam.get(teamCode) || {};
+      assignments.push({
+        teamCode,
+        stationId: a.stationId || null,    // BOOTH id / ballot id (KKD-0016)
+        stationCode: a.stationCode || null,// venue/ballot unit (016)
+        stationMandal: a.stationMandal || null,
+        venueCode: a.stationCode || null,  // ballot-side view of the same verdict
+      });
+    }
+    parties = (last.stage2 && last.stage2.parties) || [];
+  } else {
+    // Fallback: JSON allocation view (older runs).
+    parties = (last.stage2 && last.stage2.parties) || [];
+    assignments = (last.stage3 && last.stage3.assignments) || [];
+  }
+
   const microObservers = parties.reduce(function (n, p) {
     return n + (p.members || []).filter(function (m) { return m.isMicroObserver; }).length;
   }, 0);
 
-  res.json({
+  return res.json({
     ok: true,
     runAt: last.runAt,
     runBy: last.runBy,
@@ -61,17 +116,27 @@ router.get('/allocation', authorize('authority', 'admin'), async (req, res) => {
       microObserversAssigned: (last.stage2 && last.stage2.microObserversAssigned) || 0,
       unmetRequirements: (last.stage2 && last.stage2.unmetRequirements) || [],
     },
+    // Officer-level Stage-3 allocation view (roster-driven).
     stage3: {
       status: last.stage3 && last.stage3.status,
       publicationStatus: last.stage3 && last.stage3.publicationStatus,
       assignments: assignments.map(function (a) {
-        return { teamCode: a.teamCode, stationId: a.stationId, stationCode: a.stationCode };
+        return {
+          teamCode: a.teamCode,
+          stationId: a.stationId,
+          stationCode: a.stationCode,
+          stationMandal: a.stationMandal || null,
+        };
       }),
     },
+    officers: Array.from(personnelByTeam.entries()).map(function ([teamCode, members]) {
+      return { teamCode, members };
+    }),
     counts: {
       parties: parties.length,
       assignments: assignments.length,
-      microObservers: microObservers,
+      microObservers,
+      officers: personnelByTeam.size,
     },
     publication: getPublication(),
   });

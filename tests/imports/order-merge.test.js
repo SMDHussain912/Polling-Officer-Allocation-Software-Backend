@@ -3,7 +3,8 @@
 /**
  * tests/imports/order-merge.test.js
  *
- * Unit tests for the order-merge engine + the Gmail attachment (MIME) path.
+ * Unit tests for the order-merge engine. The Gmail mail path was removed
+ * with the mail send system — the final test proves it stays gone.
  * Pure — builds a minimal .docx in memory, merges, and inspects the encoded
  * Gmail message. No database, no live API.
  *
@@ -15,7 +16,7 @@ const assert = require('node:assert/strict');
 const PizZip = require('pizzip');
 
 const { mergeDocx, buildMergeData, filenameFor } = require('../../src/modules/imports/order-merge.service');
-const { createGmailProvider } = require('../../src/modules/notifications/providers');
+const providers = require('../../src/modules/notifications/providers');
 
 // Minimal valid .docx whose body contains two tags.
 function makeTemplate() {
@@ -77,47 +78,12 @@ test('filenameFor is deterministic and filesystem-safe', () => {
   assert.ok(!/[^a-zA-Z0-9._-]/.test(fn));
 });
 
-// --- Gmail attachment (MIME multipart) -------------------------------------
+// --- Mail system removal -------------------------------------------------
 
-function makeGmail(httpSpy) {
-  return createGmailProvider({
-    env: { GMAIL_SENDER_EMAIL: 'noreply@example.gov', GMAIL_ACCESS_TOKEN: 'tok' },
-    httpClient: httpSpy,
-  });
-}
-
-function decodeRaw(body) {
-  // The provider base64url-encodes the full RFC822 message in body.raw.
-  return Buffer.from(body.raw, 'base64url').toString('utf8');
-}
-
-test('gmail: plain message unchanged (no attachments) -> text/plain', async () => {
-  let captured = null;
-  const gmail = makeGmail(async (url, opts) => { captured = JSON.parse(opts.body); return { ok: true, status: 200, data: { id: 'm1' } }; });
-  await gmail.send({ to: 'a@b.c', subject: 'Hi', message: 'body' });
-  const raw = decodeRaw(captured);
-  assert.ok(raw.includes('Content-Type: text/plain'));
-  assert.ok(!raw.includes('multipart/mixed'));
-  assert.equal(captured.id, undefined); // provider returns {id}, we captured body not response
-});
-
-test('gmail: with attachment -> multipart/mixed + base64 part', async () => {
-  let captured = null;
-  const gmail = makeGmail(async (url, opts) => { captured = JSON.parse(opts.body); return { ok: true, status: 200, data: { id: 'm2' } }; });
-  const att = { filename: 'order.docx', contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', content: Buffer.from('DOCXBYTES').toString('base64') };
-  await gmail.send({ to: 'a@b.c', subject: 'Order', message: 'see attached', attachments: [att] });
-  const raw = decodeRaw(captured);
-  assert.ok(raw.includes('MIME-Version: 1.0'));
-  assert.ok(raw.includes('multipart/mixed'));
-  assert.ok(raw.includes('Content-Disposition: attachment; filename="order.docx"'));
-  assert.ok(raw.includes('Content-Transfer-Encoding: base64'));
-  assert.ok(raw.includes('see attached'));
-  // the base64 payload round-trips back to the original bytes
-  assert.ok(raw.includes(Buffer.from('DOCXBYTES').toString('base64')));
-});
-
-test('gmail: unconfigured -> throws NotificationConfigError (fail closed)', async () => {
-  const gmail = createGmailProvider({ env: {}, httpClient: async () => ({ ok: true, status: 200, data: {} }) });
-  assert.equal(gmail.isConfigured(), false);
-  await assert.rejects(() => gmail.send({ to: 'a@b.c', message: 'x' }), (e) => e.code === 'NOTIFICATION_NOT_CONFIGURED');
+test('mail send system removed: no Gmail provider, no attachments path', () => {
+  assert.equal(providers.createGmailProvider, undefined,
+    'createGmailProvider must no longer be exported');
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '../../src/modules/notifications/providers.js'), 'utf8');
+  assert.ok(!/gmail/i.test(src), 'providers.js must contain no Gmail code');
 });

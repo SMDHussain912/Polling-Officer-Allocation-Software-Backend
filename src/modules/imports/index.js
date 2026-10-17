@@ -40,6 +40,7 @@ const {
   replaceMicroObservers,
   replaceTrainingLocations,
   replaceTrainingSessions,
+  replaceMandalAdjacency,
   replaceRequirements,
   createTrainingBatches,
   clearTrainingBatches,
@@ -318,6 +319,18 @@ router.get('/training-locations', authorize('staff', 'authority', 'admin'), asyn
   }
 });
 
+router.get('/mandal-adjacency', authorize('staff', 'authority', 'admin'), async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, mandal_name, near_mandal_names, updated_at FROM mandal_adjacency ORDER BY mandal_name LIMIT 2000'
+    );
+    res.json({ ok: true, count: rows.length, adjacency: rows });
+  } catch (err) {
+    console.error('list mandal adjacency failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load mandal adjacency' });
+  }
+});
+
 router.get('/requirements', authorize('staff', 'authority', 'admin'), async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -344,7 +357,7 @@ router.get('/training-batches', authorize('staff', 'authority', 'admin'), async 
     const membersRes = await pool.query(
       `SELECT m.batch_id, m.personnel_id, m.added_by_code,
               p.employee_id, p.employee_name, p.designation, p.mobile_no,
-              p.email, p.work_mandal
+              p.work_mandal
          FROM training_batch_members m
          JOIN personnel p ON p.id = m.personnel_id
         ORDER BY p.employee_name`
@@ -421,12 +434,19 @@ router.post(
 );
 
 router.post(
+  '/mandal-adjacency',
+  authorize('authority', 'admin'),
+  (req, res) => handleIntake(req, res, (buffer) => replaceMandalAdjacency({ buffer }))
+);
+
+// Training orders (PO/APO/OPO separate tables).
+router.post(
   '/requirements',
   authorize('authority', 'admin'),
   (req, res) => handleIntake(req, res, (buffer) => replaceRequirements({ buffer }))
 );
 
-// Training orders (PO/APO separate tables — see TRAINING-ORDERS-ANALYSIS.md).
+// Training orders (PO/APO/OPO separate tables).
 router.post(
   '/training-orders/allocate',
   authorize('authority', 'admin'),
@@ -727,54 +747,27 @@ router.delete('/order-assignments/:id', authorize('authority', 'admin'), async (
 });
 
 // ---------------------------------------------------------------------------
-// Order generation + email (order-merge engine).
+// Order generation (order-merge engine).
 //   POST /order-assignments/:id/generate            -> generate .docx (metadata)
-//   POST /order-assignments/:id/generate-and-send   -> generate + email attach
-// Templates come from order_templates; metadata from order_config; the merged
-// .docx is emailed as an attachment (Gmail). Fails closed when no template,
-// no email on file, or the provider is unconfigured (never a fake success).
+// Templates come from order_templates; metadata from order_config. The merged
+// .docx bytes are returned base64 so the caller can download them. Fails
+// closed when no template exists (never a fake success).
 // ---------------------------------------------------------------------------
 router.post(
   '/order-assignments/:id/generate',
   authorize('authority', 'admin'),
   async (req, res) => {
     try {
-      const { generateOrderDocx } = require('./order-generation.service');
-      const { fileName, buffer, templateKind } = await generateOrderDocx(req.params.id);
-      res.json({
-        ok: true,
-        fileName,
-        templateKind,
-        bytes: buffer.length,
-        // base64 so the client can download/save without a disk round-trip.
-        docxBase64: buffer.toString('base64'),
+      const { generateOrder } = require('./order-generation.service');
+      const result = await generateOrder({
+        assignmentId: req.params.id,
+        actorId: req.session.user.id,
       });
+      res.json(result);
     } catch (err) {
       const status = err.statusCode || 500;
       if (status >= 500) console.error('generate order failed:', err);
       res.status(status).json({ ok: false, error: err.message || 'Failed to generate order' });
-    }
-  }
-);
-
-router.post(
-  '/order-assignments/:id/generate-and-send',
-  authorize('authority', 'admin'),
-  async (req, res) => {
-    try {
-      const { generateAndSend } = require('./order-generation.service');
-      const result = await generateAndSend({
-        assignmentId: req.params.id,
-        sendEmail: true,
-        actorId: req.session.user.id,
-      });
-      // 200 even when email could not be sent — the doc was generated; the
-      // emailError field explains why it was not emailed (fail-closed, honest).
-      res.json(result);
-    } catch (err) {
-      const status = err.statusCode || 500;
-      if (status >= 500) console.error('generate-and-send failed:', err);
-      res.status(status).json({ ok: false, error: err.message || 'Failed to generate/send order' });
     }
   }
 );

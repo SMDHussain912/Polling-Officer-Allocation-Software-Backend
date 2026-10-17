@@ -9,25 +9,9 @@ const duties = require('./stage2.duties');
 const { Stage2ValidationError } = require('./stage2.errors');
 const { validateStage2Request } = require('./stage2.validator');
 const { isMandalBarred } = require('./stage2.mandal');
+const { buildAdjacencyLookup } = require('./stage2.adjacency');
 const formation = require('./stage2.formation');
 const { MICRO_OBSERVER_ROLE, assignMicroObservers } = require('../randomization/micro-observer');
-
-/**
- * Team-level 20% substitution (team decision 2026-10-14): this is PER TEAM,
- * not per mandal. A full team (e.g. PO + MO + 5 officers = 7) gets
- * ceil(teamSize x 20%) extra members drawn from the leftover pool as
- * substitutes (e.g. 7 x 0.2 = 1.4 -> 2). Substitutes are deployment-ready
- * backups attached to their team; a team whose substitutes cannot be filled
- * is reported, never silently left short.
- */
-const SUBSTITUTE_FRACTION_NUMERATOR = 1;
-const SUBSTITUTE_FRACTION_DENOMINATOR = 5;
-
-function substituteCountFor(teamSize) {
-  return Math.ceil(
-    (teamSize * SUBSTITUTE_FRACTION_NUMERATOR) / SUBSTITUTE_FRACTION_DENOMINATOR
-  );
-}
 
 function createStage2Service(deps) {
   deps = deps || {};
@@ -44,13 +28,14 @@ function createStage2Service(deps) {
     const electionShort = formation.electionShortOf(t.stage1Run.electionConfigurationId);
     let parties = [];
     let shortageParties = 0;
-    let substituteShortfall = [];
     if (t.options.allowShortageFallback) {
       // Two-phase: full 1+5 parties first, then 1+4 parties (merged 3rd+4th
       // duty on ONE person) from whoever is left. partiesRequested caps the
       // total across both phases.
+      const adjacency = buildAdjacencyLookup(t.options.mandalAdjacency);
       const phased = formation.formPartiesWithFallback(pool, {
         postings: t.options.postingMandals,
+        adjacency: adjacency.size > 0 ? adjacency : null,
         randomInt: randomInt,
         maxAttempts: maxAttempts,
         allowShortageFallback: true,
@@ -84,9 +69,11 @@ function createStage2Service(deps) {
       verifyMixedInvariants(t.employees, parties);
     } else {
       const partySize = PRESIDING_OFFICERS_PER_PARTY + t.options.pollingOfficersPerParty;
+      const adjacency = buildAdjacencyLookup(t.options.mandalAdjacency);
       const result = formation.formParties(pool, {
         partySize: partySize,
         postings: t.options.postingMandals,
+        adjacency: adjacency.size > 0 ? adjacency : null,
         randomInt: randomInt,
         maxAttempts: maxAttempts,
         partiesRequested: t.options.partiesRequested,
@@ -112,15 +99,14 @@ function createStage2Service(deps) {
       });
       verifyInvariants(t.employees, parties, partySize);
 
-      // NOTE: 20% substitutes and one Micro Observer per party are assigned
-      // AFTER both formation paths below (coverage for full and shortage
-      // parties alike) — never silently skipped.
+      // NOTE: one Micro Observer per party is assigned AFTER both formation
+      // paths below (full and shortage parties alike) — never silently skipped.
+      // No substitutes are added: teams are exactly the officers formed here.
     }
     // --- ONE Micro Observer per formed party (integrated into Stage 2). ----
     // SOURCE (team decision 2026-10-15): a SEPARATE MO candidate list
     // (bank staff uploaded via POST /api/imports/micro-observers) passed as
-    // options.moCandidates. Substitutes always come from OFFICER leftover —
-    // never from the MO list. When moCandidates is absent/empty, fall back to
+    // options.moCandidates. When moCandidates is absent/empty, fall back to
     // the legacy path (officer pool + designationRules microObserverEligible)
     // so existing single-pool flows keep working.
     var useSeparateMoPool = Array.isArray(t.options.moCandidates) && t.options.moCandidates.length > 0;
@@ -180,47 +166,6 @@ function createStage2Service(deps) {
     parties = moPlan.parties;
     var microObserversAssigned = moPlan.assignedCount;
 
-    // --- 20% substitutes per team (team decision 2026-10-14). ----------------
-    // Drawn from the unassigned leftover AFTER core formation AND MO
-    // assignment, so substitutes never reuse a team member or an MO.
-    // Each team of size N gets ceil(N x 20%) substitutes (e.g. 7 -> 2).
-    // Shortfall is reported per team, never silently left short. Drawn from
-    // t.employees (full records) so substitutes carry office/seniority fields.
-    var coreKeys = {};
-    parties.forEach(function (party) {
-      party.members.forEach(function (m) { coreKeys[String(m.personnelId)] = true; });
-    });
-    var stillFree = t.employees.filter(function (e) { return !coreKeys[String(e.personnelKey)]; });
-    var subIdx = 0;
-    substituteShortfall = [];
-    parties.forEach(function (party) {
-      var need = substituteCountFor(party.members.length);
-      party.substitutes = [];
-      party.substitutesRequired = need;
-      for (var s = 0; s < need; s += 1) {
-        if (subIdx >= stillFree.length) {
-          substituteShortfall.push({ teamCode: party.teamCode, missing: need - s });
-          break;
-        }
-        var sub = stillFree[subIdx++];
-        party.substitutes.push({
-          personnelId: sub.personnelId,
-          name: sub.name,
-          designation: sub.designation,
-          officeId: sub.officeId,
-          officeName: sub.officeName,
-          seniorityRank: sub.seniorityRank,
-          classification: sub.classification,
-          substituteFor: party.teamCode,
-        });
-      }
-    });
-    parties.forEach(function (party) {
-      (party.substitutes || []).forEach(function (m) {
-        coreKeys[String(m.personnelId)] = true;
-      });
-    });
-
     // excelRows: operational members + appended Micro Observer per party.
     // Source rows stay resolved against full employee records; MO members
     // from a SEPARATE uploaded pool resolve from the MO pool map instead
@@ -253,7 +198,6 @@ function createStage2Service(deps) {
     const usedKeys = new Set();
     parties.forEach(function (p) {
       p.members.forEach(function (m) { usedKeys.add(String(m.personnelId)); });
-      (p.substitutes || []).forEach(function (m) { usedKeys.add(String(m.personnelId)); });
     });
     const unassigned = t.employees.filter(function (e) {
       return !usedKeys.has(e.personnelKey);
@@ -265,10 +209,7 @@ function createStage2Service(deps) {
         reason: held ? 'reserve_held' : 'no_eligible_party_slot',
       };
     });
-    const unmetRequirements = substituteShortfall.map(function (st) {
-      return { code: 'SUBSTITUTES_SHORT', teamCode: st.teamCode, missing: st.missing,
-        message: 'Team could not be given its full 20% substitutes; leftover pool exhausted.' };
-    });
+    const unmetRequirements = [];
     (moPlan.unmetRequirements || []).forEach(function (u) { unmetRequirements.push(u); });
     if (t.options.partiesRequested > 0 && parties.length < t.options.partiesRequested) {
       unmetRequirements.push({
@@ -294,7 +235,6 @@ function createStage2Service(deps) {
       pollingOfficersPerParty: t.options.pollingOfficersPerParty,
       shortageReason: t.options.shortageReason,
       parties: parties, excelRows: excelRows, unassigned: unassigned,
-      substituteCount: parties.reduce(function (n, party) { return n + (party.substitutes || []).length; }, 0),
       microObserversAssigned: microObserversAssigned,
       reserveHeld: reserveHeld.map(function (e) {
         return { personnelId: e.personnelId, name: e.name, classification: e.classification };

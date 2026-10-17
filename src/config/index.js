@@ -18,6 +18,8 @@ module.exports = {
     date: process.env.TRAINING_DATE || '',
     timeFrom: process.env.TRAINING_TIME_FROM || '',
     timeTo: process.env.TRAINING_TIME_TO || '',
+    venue: process.env.TRAINING_VENUE || '',
+    mandal: process.env.TRAINING_MANDAL || '',
   },
   orders: {
     pollingDateTime: process.env.POLLING_DATE_TIME || '',

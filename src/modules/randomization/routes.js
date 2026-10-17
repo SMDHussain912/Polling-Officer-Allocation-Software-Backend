@@ -143,8 +143,22 @@ router.post('/run', async (req, res) => {
       moRows = null;
     }
 
+    // --- Near-mandal adjacency (migration 019). --------------------------
+    // Loaded on every run; empty table keeps the legacy posting/station
+    // behaviour. Never fails the run when the table is missing.
+    let mandalAdjacencyRows = [];
+    try {
+      const adjResult = await pool.query(
+        'SELECT mandal_name, near_mandal_names FROM mandal_adjacency LIMIT 2000'
+      );
+      mandalAdjacencyRows = adjResult.rows;
+    } catch (err) {
+      mandalAdjacencyRows = [];
+    }
+
     // --- Execute the three-stage chain. ---------------------------------
     const result = await runAllocation({
+      mandalAdjacencyRows: mandalAdjacencyRows,
       personnelRows: personnelResult.rows,
       stationRows: stationsResult.rows,
       departmentName: departmentName,

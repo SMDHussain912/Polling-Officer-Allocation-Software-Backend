@@ -310,10 +310,56 @@ function parseTrainingSessions(buffer) {
   return { accepted, rejected };
 }
 
+/**
+ * parseMandalAdjacency(buffer) -> { accepted, rejected }
+ * Required: mandal_name. Near mandals come from a single
+ * near_mandal_names column holding comma/semicolon/newline-separated names
+ * (e.g. "Kajuluru, Karapa; Samalkota"). A mandal with no near names is
+ * accepted with an empty list (fail-closed at run time: no eligible duty
+ * mandal -> reported in unmetRequirements).
+ */
+function parseMandalAdjacency(buffer) {
+  const grid = readGrid(buffer);
+  const { colMap, headerRow } = mapHeader(grid, {
+    mandal_name: ['mandalname', 'mandal'],
+    near_mandal_names: ['near', 'adjacent', 'neighbour', 'neighbor'],
+  });
+  const accepted = [];
+  const rejected = [];
+  const seen = new Set();
+  for (let i = headerRow + 1; i < grid.length; i += 1) {
+    const row = grid[i] || [];
+    const get = (f) => (colMap[f] !== undefined ? normalizeCell(row[colMap[f]]) : '');
+    const mandalName = get('mandal_name');
+    if (!mandalName) continue;
+    const reasons = [];
+    const key = mandalName.toLowerCase();
+    if (seen.has(key)) reasons.push('duplicate_mandal_in_file');
+    else seen.add(key);
+    // Split near names on comma, semicolon, pipe or newline; drop empties and
+    // self-references; dedupe case-insensitively preserving first spelling.
+    const nearSeen = new Set();
+    const near = [];
+    for (const part of String(get('near_mandal_names') || '').split(/[,\n;|]/)) {
+      const name = String(part).replace(/\s+/g, ' ').trim();
+      if (!name) continue;
+      if (name.toLowerCase() === key) continue;
+      if (nearSeen.has(name.toLowerCase())) continue;
+      nearSeen.add(name.toLowerCase());
+      near.push(name);
+    }
+    const record = { mandal_name: mandalName, near_mandal_names: near };
+    if (reasons.length > 0) rejected.push({ sheetRow: i + 1, employeeId: null, reasons });
+    else accepted.push(record);
+  }
+  return { accepted, rejected };
+}
+
 module.exports = {
   IntakeParseError,
   parseMicroObservers,
   parseTrainingLocations,
   parseTrainingSessions,
   parseRequirements,
+  parseMandalAdjacency,
 };

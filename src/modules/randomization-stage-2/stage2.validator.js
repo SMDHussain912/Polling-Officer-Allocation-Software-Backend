@@ -194,8 +194,7 @@ function validateOptions(raw) {
   // moCandidates: OPTIONAL separate Micro Observer pool (bank staff uploaded
   // via POST /api/imports/micro-observers). When supplied, MOs are drawn
   // ONLY from this list — never from officers. Each entry needs personnelId
-  // (unique), name, officeId, workMandal, nativeMandal. Substitutes always
-  // come from officer leftover, never from moCandidates. When omitted/empty,
+  // (unique), name, officeId, workMandal, nativeMandal. When omitted/empty,
   // Stage 2 keeps its legacy behavior (officer pool + designationRules
   // microObserverEligible) so existing single-pool flows still work.
   let moCandidates = null;
@@ -243,11 +242,22 @@ function validateOptions(raw) {
       moSeen.add(c.personnelKey);
     }
   }
+  // Near-mandal adjacency (migration 019): [{ mandal_name, near_mandal_names[] }].
+  // When supplied and non-empty, Stage 2 picks party postings only from near
+  // mandals. Empty/omitted keeps the legacy posting behaviour.
+  let mandalAdjacency = [];
+  if (raw.mandalAdjacency !== undefined && raw.mandalAdjacency !== null) {
+    if (!Array.isArray(raw.mandalAdjacency)) {
+      throw new Stage2ValidationError('mandalAdjacency must be an array.');
+    }
+    mandalAdjacency = raw.mandalAdjacency;
+  }
   return { pollingOfficersPerParty: per, shortageReason: shortageReason,
     allowShortageFallback: allowShortageFallback,
     partiesRequested: partiesRequested, postingMandals: postingMandals,
     teamCodePrefix: prefix, useReserves: useReserves,
-    designationRules: designationRules, moCandidates: moCandidates };
+    designationRules: designationRules, moCandidates: moCandidates,
+    mandalAdjacency: mandalAdjacency };
 }
 
 function validateStage2Request(input) {

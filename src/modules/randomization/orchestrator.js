@@ -129,8 +129,7 @@ function buildStations(stationRows) {
  * @param {Array}  [input.moRows]
  *        DB micro_observers rows (separate MO upload: bank staff). When
  *        supplied and non-empty, MOs are drawn ONLY from this list —
- *        never from officers. Substitutes always come from officer
- *        leftover, never from moRows. Omitted/empty keeps the legacy
+ *        never from officers. Omitted/empty keeps the legacy
  *        single-pool behavior.
  * @param {string} input.districtId   District scope (Stage 1 actor scope).
  * @param {number|string} input.actorId  Authenticated user id (audit trail).
@@ -142,7 +141,13 @@ async function runAllocation(input) {
     personnelRows, stationRows, departmentName,
     electionConfiguration, designationRules,
     districtId, actorId, seed, officeIdOverrides, moRows,
+    mandalAdjacencyRows,
   } = input || {};
+  // Near-mandal adjacency rows [{ mandal_name, near_mandal_names[] }].
+  // Empty -> both stages keep legacy behaviour (fail-open on missing data,
+  // same as micro_observers); non-empty -> rules 1/2 (near-mandal posting)
+  // apply in Stage 2 AND Stage 3.
+  const mandalAdjacency = Array.isArray(mandalAdjacencyRows) ? mandalAdjacencyRows : [];
 
   if (!Array.isArray(personnelRows) || personnelRows.length === 0) {
     throw Object.assign(new Error('personnelRows must be a non-empty array.'), { statusCode: 400 });
@@ -257,9 +262,10 @@ async function runAllocation(input) {
         // assigns exactly one MO per formed party (fail closed when none can
         // be placed) and reports it on the returned run. When the separate
         // MO upload was supplied (moCandidates), MOs come ONLY from that
-        // bank-staff list; substitutes still come from officer leftover.
+        // bank-staff list. Teams never contain substitutes.
         designationRules: designationRules,
         moCandidates: moCandidates,
+        mandalAdjacency: mandalAdjacency,
       },
     },
     { randomInt: randomInt }
@@ -282,7 +288,27 @@ async function runAllocation(input) {
   if (stage2WithMo.status === 'completed') {
     const stations = buildStations(stationRows);
     const stage3Service = createStage3Service({ randomInt: randomInt });
-    stage3 = stage3Service.executeMapping({ stage2Run: stage2WithMo, pollingStations: stations });
+    // Per-team member mandals for the near-mandal station check (Stage 3
+    // validator strips identities; it only needs work/native mandals).
+    const membersByTeam = {};
+    const empById = {};
+    for (const e of employees) empById[String(e.personnelId)] = e;
+    for (const p of stage2WithMo.parties || []) {
+      membersByTeam[p.teamCode] = (p.members || [])
+        .map(function (m) { return empById[String(m.personnelId)] || null; })
+        .filter(Boolean)
+        .map(function (e) {
+          return { workMandal: e.workMandal, nativeMandal: e.nativeMandal };
+        });
+    }
+    stage3 = stage3Service.executeMapping({
+      stage2Run: stage2WithMo,
+      pollingStations: stations,
+      options: {
+        mandalAdjacency: mandalAdjacency,
+        teamMembers: membersByTeam,
+      },
+    });
   } else {
     stage3 = {
       status: 'not_run',

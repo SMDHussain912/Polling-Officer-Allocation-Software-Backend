@@ -69,12 +69,22 @@ function validateParty(raw, index) {
       field: where + '.teamSize',
     });
   }
-  // Only the join-relevant shape is kept. Members are NOT copied here: Stage 3
-  // maps teams (by teamCode) to stations; member rosters stay owned by Stage 2.
+  // Only the join-relevant shape is kept, plus member mandals when present
+  // (needed for the near-mandal station check; member rosters stay owned by
+  // Stage 2 — these are mandals only, never identities).
+  const members = Array.isArray(raw.members)
+    ? raw.members.map(function (m) {
+      return {
+        workMandal: m && m.workMandal !== undefined ? m.workMandal : null,
+        nativeMandal: m && m.nativeMandal !== undefined ? m.nativeMandal : null,
+      };
+    })
+    : [];
   return {
     teamCode: raw.teamCode.trim(),
     teamSize: raw.teamSize,
     postingMandal: isNonEmptyString(raw.postingMandal) ? raw.postingMandal.trim() : null,
+    members: members,
   };
 }
 
@@ -120,6 +130,27 @@ function validateOptions(raw) {
     mode = raw.mappingMode;
   }
   options.mappingMode = mode;
+  // Near-mandal adjacency (migration 019): [{ mandal_name, near_mandal_names[] }].
+  // When supplied and non-empty, Stage 3 maps each team only to stations in
+  // mandals adjacent to every member's work/native mandal. Members arrive via
+  // options.teamMembers ({ teamCode: [members] }). Empty/omitted keeps the
+  // legacy random mapping.
+  let mandalAdjacency = [];
+  if (raw.mandalAdjacency !== undefined && raw.mandalAdjacency !== null) {
+    if (!Array.isArray(raw.mandalAdjacency)) {
+      throw new Stage3ValidationError('mandalAdjacency must be an array.');
+    }
+    mandalAdjacency = raw.mandalAdjacency;
+  }
+  options.mandalAdjacency = mandalAdjacency;
+  let teamMembers = null;
+  if (raw.teamMembers !== undefined && raw.teamMembers !== null) {
+    if (typeof raw.teamMembers !== 'object' || Array.isArray(raw.teamMembers)) {
+      throw new Stage3ValidationError('teamMembers must be an object keyed by teamCode.');
+    }
+    teamMembers = raw.teamMembers;
+  }
+  options.teamMembers = teamMembers;
   return options;
 }
 
