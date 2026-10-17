@@ -185,10 +185,83 @@ function validateOptions(raw) {
       'allowShortageFallback applies only with the default 1+5 request; it falls back to 1+4 per party.'
     );
   }
+  // designationRules: { [designation]: { microObserverEligible: boolean } }.
+  // Optional; when absent or empty, no designation is MO-eligible (fail
+  // closed) — same policy as the orchestrator's original MO step.
+  let designationRules = {};
+  if (raw.designationRules !== undefined && raw.designationRules !== null) {
+    if (typeof raw.designationRules !== 'object' || Array.isArray(raw.designationRules)) {
+      throw new Stage2ValidationError('designationRules must be a plain object.');
+    }
+    designationRules = raw.designationRules;
+  }
+  // moCandidates: OPTIONAL separate Micro Observer pool (bank staff uploaded
+  // via POST /api/imports/micro-observers). When supplied, MOs are drawn
+  // ONLY from this list — never from officers. Each entry needs personnelId
+  // (unique), name, officeId, workMandal, nativeMandal. When omitted/empty,
+  // Stage 2 keeps its legacy behavior (officer pool + designationRules
+  // microObserverEligible) so existing single-pool flows still work.
+  let moCandidates = null;
+  if (raw.moCandidates !== undefined && raw.moCandidates !== null) {
+    if (!Array.isArray(raw.moCandidates)) {
+      throw new Stage2ValidationError('moCandidates must be an array.');
+    }
+    moCandidates = raw.moCandidates.map(function (c, i) {
+      const where = 'moCandidates[' + i + ']';
+      if (!c || typeof c !== 'object' || Array.isArray(c)) {
+        throw new Stage2ValidationError(where + ' must be an object.');
+      }
+      if (c.personnelId === undefined || c.personnelId === null || String(c.personnelId).trim() === '') {
+        throw new Stage2ValidationError(where + '.personnelId is required.');
+      }
+      if (typeof c.name !== 'string' || c.name.trim() === '') {
+        throw new Stage2ValidationError(where + '.name is required.');
+      }
+      if (c.officeId === undefined || c.officeId === null || String(c.officeId).trim() === '') {
+        throw new Stage2ValidationError(where + '.officeId is required (distinct-office rule).');
+      }
+      if (typeof c.workMandal !== 'string' || c.workMandal.trim() === '') {
+        throw new Stage2ValidationError(where + '.workMandal is required (posting-ban rule).');
+      }
+      if (typeof c.nativeMandal !== 'string' || c.nativeMandal.trim() === '') {
+        throw new Stage2ValidationError(where + '.nativeMandal is required (posting-ban rule).');
+      }
+      return {
+        personnelId: String(c.personnelId).trim(),
+        personnelKey: String(c.personnelId).trim().toLowerCase(),
+        name: c.name.trim(),
+        designation: typeof c.designation === 'string' && c.designation.trim() !== '' ? c.designation.trim() : 'Micro Observer',
+        officeId: c.officeId,
+        officeName: c.officeName !== undefined && c.officeName !== null ? c.officeName : c.officeId,
+        officeKey: String(c.officeId).trim().toLowerCase(),
+        workMandal: c.workMandal.trim(),
+        nativeMandal: c.nativeMandal.trim(),
+      };
+    });
+    const moSeen = new Set();
+    for (const c of moCandidates) {
+      if (moSeen.has(c.personnelKey)) {
+        throw new Stage2ValidationError('Duplicate personnelId in moCandidates: ' + c.personnelId + '.');
+      }
+      moSeen.add(c.personnelKey);
+    }
+  }
+  // Near-mandal adjacency (migration 019): [{ mandal_name, near_mandal_names[] }].
+  // When supplied and non-empty, Stage 2 picks party postings only from near
+  // mandals. Empty/omitted keeps the legacy posting behaviour.
+  let mandalAdjacency = [];
+  if (raw.mandalAdjacency !== undefined && raw.mandalAdjacency !== null) {
+    if (!Array.isArray(raw.mandalAdjacency)) {
+      throw new Stage2ValidationError('mandalAdjacency must be an array.');
+    }
+    mandalAdjacency = raw.mandalAdjacency;
+  }
   return { pollingOfficersPerParty: per, shortageReason: shortageReason,
     allowShortageFallback: allowShortageFallback,
     partiesRequested: partiesRequested, postingMandals: postingMandals,
-    teamCodePrefix: prefix, useReserves: useReserves };
+    teamCodePrefix: prefix, useReserves: useReserves,
+    designationRules: designationRules, moCandidates: moCandidates,
+    mandalAdjacency: mandalAdjacency };
 }
 
 function validateStage2Request(input) {

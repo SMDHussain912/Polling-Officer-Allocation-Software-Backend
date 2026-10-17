@@ -52,9 +52,8 @@ function createNotificationService(deps) {
       });
       const channels = {};
       status.forEach(function (c) {
-        const hasDestination =
-          (c.channel === 'email' && r.email) ||
-          ((c.channel === 'sms' || c.channel === 'whatsapp') && r.mobile);
+        // SMS + WhatsApp both route to the officer's mobile number.
+        const hasDestination = !!r.mobile;
         channels[c.channel] = {
           configured: c.configured,
           destinationAvailable: !!hasDestination,
@@ -81,7 +80,7 @@ function createNotificationService(deps) {
 
   /** Destination lookup for a recipient on a channel (never logged). */
   function destinationFor(recipient, channel) {
-    if (channel === 'email') return recipient.email || null;
+    // SMS + WhatsApp both route to the officer's mobile number.
     if (channel === 'sms' || channel === 'whatsapp') return recipient.mobile || null;
     return null;
   }

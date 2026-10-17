@@ -1,8 +1,7 @@
 'use strict';
 
 /**
- * Notification provider adapters — Fast2SMS (SMS), Meta WhatsApp Cloud API,
- * and Gmail API.
+ * Notification provider adapters — Fast2SMS (SMS) and Meta WhatsApp Cloud API.
  *
  * Contract (every provider):
  *   isConfigured()            -> boolean
@@ -133,63 +132,10 @@ function createWhatsAppProvider(opts) {
   return { name: 'whatsapp', channel: 'whatsapp', isConfigured, status, send };
 }
 
-// --- Gmail API --------------------------------------------------------------
-function createGmailProvider(opts) {
-  opts = opts || {};
-  const env = opts.env || process.env;
-  const senderEmail = env.GMAIL_SENDER_EMAIL;
-  const accessToken = env.GMAIL_ACCESS_TOKEN;
-  const httpClient = opts.httpClient || defaultHttpPost;
-
-  function isConfigured() { return !!(senderEmail && accessToken); }
-  function status() {
-    const missing = [];
-    if (!senderEmail) missing.push('GMAIL_SENDER_EMAIL');
-    if (!accessToken) missing.push('GMAIL_ACCESS_TOKEN');
-    return { configured: isConfigured(), missing: missing };
-  }
-
-  async function send(input) {
-    if (!isConfigured()) {
-      throw new NotificationConfigError(
-        'Gmail is not configured (GMAIL_SENDER_EMAIL / GMAIL_ACCESS_TOKEN missing).'
-      );
-    }
-    // RFC 2822 message, base64url-encoded for the Gmail users.messages.send API.
-    const subject = input.subject || 'Polling Duty Assignment';
-    const raw = [
-      'From: ' + senderEmail,
-      'To: ' + input.to,
-      'Subject: ' + subject,
-      'Content-Type: text/plain; charset="UTF-8"',
-      '',
-      input.message,
-    ].join('\r\n');
-    const encoded = Buffer.from(raw, 'utf8').toString('base64url');
-    const url = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
-    const res = await httpClient(url, {
-      method: 'POST',
-      headers: { authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ raw: encoded }),
-    });
-    if (!res.ok) {
-      const err = new Error('Gmail send failed (HTTP ' + res.status + ')');
-      err.statusCode = res.status;
-      err.transient = res.status === 429 || res.status >= 500;
-      throw err;
-    }
-    const data = res.data || {};
-    return { providerMessageId: data.id || null, provider: 'gmail' };
-  }
-
-  return { name: 'gmail', channel: 'email', isConfigured, status, send };
-}
-
 module.exports = {
   NotificationConfigError: NotificationConfigError,
   isTransient: isTransient,
   createFast2smsProvider: createFast2smsProvider,
   createWhatsAppProvider: createWhatsAppProvider,
-  createGmailProvider: createGmailProvider,
 };
 

@@ -33,6 +33,23 @@ function createStage3Service(deps) {
   function executeMapping(input) {
     const t = validateStage3Request(input);
     const result = mapping.mapTeamsToStations(t.parties, t.pollingStations, randomInt, t.options.maxAttempts);
+    // Near-mandal mode (migration 019): pass adjacency + per-team member
+    // mandals so stations are chosen from near mandals of every member.
+    const { buildAdjacencyLookup } = require('../randomization-stage-2/stage2.adjacency');
+    const adjacency = buildAdjacencyLookup(t.options.mandalAdjacency);
+    let membersByTeam = t.options.teamMembers || null;
+    if (!membersByTeam) {
+      // Fall back to members carried on the validated parties (Stage 2 shape).
+      membersByTeam = {};
+      for (const p of t.parties) {
+        if (p.members && p.members.length > 0) membersByTeam[p.teamCode] = p.members;
+      }
+      if (Object.keys(membersByTeam).length === 0) membersByTeam = null;
+    }
+    const result = mapping.mapTeamsToStations(t.parties, t.pollingStations, randomInt, {
+      adjacency: adjacency.size > 0 ? adjacency : null,
+      membersByTeam: membersByTeam,
+    });
 
     const unmetRequirements = result.unmetRequirements.slice();
     const complete = unmetRequirements.length === 0;

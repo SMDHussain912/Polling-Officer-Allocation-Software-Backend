@@ -46,6 +46,7 @@ function checkRandomInt(fn) {
  * `assignments` entries carry ONLY teamCode + station identity + the
  * confidential publication state — never personnel or sensitive fields.
  */
+
 function mapTeamsToStations(parties, pollingStations, randomInt, maxAttempts) {
   const rand = checkRandomInt(randomInt);
   const attempts = maxAttempts || 50;
@@ -69,6 +70,36 @@ function mapTeamsToStations(parties, pollingStations, randomInt, maxAttempts) {
         workMandal: mandalNormalize(m.workMandal || m.work_mandal),
         nativeMandal: mandalNormalize(m.nativeMandal || m.native_mandal),
       };
+=======
+function mapTeamsToStations(parties, pollingStations, randomInt, opts) {
+  opts = opts || {};
+  const adjacency = opts.adjacency || null; // stage2.adjacency lookup or null
+  const membersByTeam = opts.membersByTeam || null; // { teamCode: [members] }
+  const rand = checkRandomInt(randomInt);
+
+  // --- Near-mandal mode: each team gets a station whose mandal is near EVERY
+  // member's work/native mandal (and in none of their own). Greedy over
+  // shuffled teams; leftovers are reported, never force-assigned.
+  if (adjacency && adjacency.size > 0 && membersByTeam) {
+    return mapTeamsToStationsNearMandal(parties, pollingStations, adjacency, membersByTeam, rand);
+  }
+
+  const shuffledParties = shuffleInPlace(parties.slice(), rand);
+  const shuffledStations = shuffleInPlace(pollingStations.slice(), rand);
+
+  const pairCount = Math.min(shuffledParties.length, shuffledStations.length);
+  const assignments = [];
+  for (let i = 0; i < pairCount; i += 1) {
+    const party = shuffledParties[i];
+    const station = shuffledStations[i];
+    assignments.push({
+      teamCode: party.teamCode,
+      teamSize: party.teamSize,
+      postingMandal: party.postingMandal,
+      stationId: station.stationId,
+      stationCode: station.stationCode,
+      stationMandal: station.mandal,
+      publicationStatus: PUBLICATION_STATUS.CONFIDENTIAL,
     });
     return {
       teamCode: p.teamCode,
@@ -196,8 +227,80 @@ function mapTeamsToStations(parties, pollingStations, randomInt, maxAttempts) {
   };
 }
 
+
+/**
+ * Near-mandal Stage 3 mapping. Shuffles teams, then for each team takes the
+ * first still-free station passing stationEligibleForTeam (near every
+ * member, in none of their home mandals). Unplaceable teams land in
+ * unmetRequirements with code TEAMS_WITHOUT_NEAR_STATION.
+ */
+function mapTeamsToStationsNearMandal(parties, pollingStations, adjacency, membersByTeam, rand) {
+  const adj = require('../randomization-stage-2/stage2.adjacency');
+  const shuffledParties = shuffleInPlace(parties.slice(), rand);
+  const shuffledStations = shuffleInPlace(pollingStations.slice(), rand);
+  const taken = new Set();
+  const assignments = [];
+  const unplaced = [];
+  for (const party of shuffledParties) {
+    const members = membersByTeam[party.teamCode] || [];
+    let placed = false;
+    for (const station of shuffledStations) {
+      if (taken.has(station.stationId)) continue;
+      const check = adj.stationEligibleForTeam(station.mandal, members, adjacency);
+      if (!check.ok) continue;
+      taken.add(station.stationId);
+      assignments.push({
+        teamCode: party.teamCode,
+        teamSize: party.teamSize,
+        postingMandal: party.postingMandal,
+        stationId: station.stationId,
+        stationCode: station.stationCode,
+        stationMandal: station.mandal,
+        publicationStatus: PUBLICATION_STATUS.CONFIDENTIAL,
+      });
+      placed = true;
+      break;
+    }
+    if (!placed) unplaced.push(party.teamCode);
+  }
+  const unmetRequirements = [];
+  const freeStations = shuffledStations.filter(function (st) { return !taken.has(st.stationId); });
+  if (unplaced.length > 0) {
+    unmetRequirements.push({
+      code: 'TEAMS_WITHOUT_NEAR_STATION',
+      count: unplaced.length,
+      teamCodes: unplaced,
+      message: 'No free polling station in a mandal adjacent to every team member; ' +
+        'these teams were not force-assigned.',
+    });
+  }
+  if (freeStations.length > 0 && unplaced.length === 0 && shuffledParties.length < shuffledStations.length) {
+    unmetRequirements.push({
+      code: 'STATIONS_WITHOUT_TEAM',
+      count: freeStations.length,
+      stationIds: freeStations.map(function (st) { return st.stationId; }),
+      message: 'More polling stations than polling parties. Deficit handling is unresolved; ' +
+        'no station was double-staffed.',
+    });
+  }
+  if (shuffledParties.length > shuffledStations.length) {
+    const surplus = shuffledParties.slice(assignments.length + unplaced.length).map(function (p) { return p.teamCode; });
+    if (surplus.length > 0) {
+      unmetRequirements.push({
+        code: 'TEAMS_WITHOUT_STATION',
+        count: surplus.length,
+        teamCodes: surplus,
+        message: 'More polling parties than polling stations. Surplus handling is unresolved; ' +
+          'no party was force-assigned.',
+      });
+    }
+  }
+  return { assignments: assignments, unmetRequirements: unmetRequirements };
+}
+
 module.exports = {
   shuffleInPlace: shuffleInPlace,
   defaultRandomInt: defaultRandomInt,
   mapTeamsToStations: mapTeamsToStations,
+  mapTeamsToStationsNearMandal: mapTeamsToStationsNearMandal,
 };

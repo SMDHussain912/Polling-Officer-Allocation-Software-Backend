@@ -3,10 +3,11 @@
 /**
  * Stage: imports — persistence for a personnel import.
  *
- * One import = one import_batches row + accepted rows in personnel, written
- * atomically (single transaction). Rejected rows are NOT stored as personnel
- * rows; they are returned to the caller as { sheetRow, reasons } so the
- * operator can fix the sheet and re-upload (batch keeps the counts).
+ * One import = one import_batches row + accepted rows in personnel +
+ * rejected rows in import_rejected_rows, written atomically (single
+ * transaction). Rejected rows carry import_status='rejected' semantics via
+ * their own table + the reasons array, so the frontend always renders stored
+ * DB data (never a local-file fallback).
  *
  * District is stamped per the confirmed single-district scope (Kakinada).
  */
@@ -84,6 +85,25 @@ async function persistPersonnelImport({ fileName, buffer, importedBy }) {
       await client.query(INSERT_SQL, [batchId, IMPORT_DISTRICT, exemptCategory, ...values]);
     }
 
+    // Team decision 2026-10-14: rejected rows are stored too (same batch,
+    // same transaction) in import_rejected_rows with reasons, so the frontend
+    // always renders stored DB data and never a local-file fallback.
+    for (const rej of rejected) {
+      const rawRow = rows.find((r) => r.sheetRow === rej.sheetRow);
+      await client.query(
+        `INSERT INTO import_rejected_rows
+           (import_batch_id, sheet_row, employee_id, reasons, raw_values)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          batchId,
+          rej.sheetRow ?? null,
+          rej.employeeId ?? null,
+          JSON.stringify(rej.reasons || []),
+          JSON.stringify((rawRow && rawRow.values) || {}),
+        ]
+      );
+    }
+
     await client.query(
       `UPDATE import_batches SET status = 'completed' WHERE id = $1`,
       [batchId]
@@ -106,4 +126,70 @@ async function persistPersonnelImport({ fileName, buffer, importedBy }) {
   }
 }
 
-module.exports = { persistPersonnelImport, IMPORT_DISTRICT };
+/**
+ * Mark (or clear) a single personnel record's official exemption status.
+ *
+ *   POST /api/imports/personnel/:id/exemption   { exemptCategory, note }
+ *
+ *  - `exemptCategory` = an official EXEMPT_CATEGORY value, or
+ *    'pending_authority_confirmation' (bank p.61(a)(vii)).
+ *  - `note` is an audit-only reason (never returned in the personnel response).
+ *
+ * Writes the personnel row AND an append-only audit record in one transaction.
+ * Sensitive categories ('pregnant', 'breastfeeding') are stored; existing read
+ * endpoints mask them with the generic 'exempt' label.
+ *
+ * 400: unknown/unauthorized category, negative id, note > 400 chars.
+ * 404: personnel not found.
+ */
+async function patchPersonnelExemption({ id, exemptCategory, note = '', req } = {}) {
+  if (!['pregnant', 'breastfeeding', 'bank_rural_single_officer', 'veterinary_staff', 'health_medical', 'nurse_anm', 'ayush_medical', 'all_india_radio', 'doordarshan', 'bsnl_mtnl_ops', 'pending_authority_confirmation', null].includes(exemptCategory)) {
+    throw new Error('unauthorized category');
+  }
+  if (typeof note !== 'string' || note.length > 400) {
+    throw new Error('note must be a string up to 400 characters');
+  }
+  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
+    throw new Error('invalid personnel id');
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const row = await client.query(
+      `SELECT id, employee_id, exempt_category, import_batch_id
+         FROM personnel WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (row.rows.length === 0) {
+      throw new Error('personnel not found');
+    }
+    const personnel = row.rows[0];
+    const oldCategory = personnel.exempt_category;
+
+    const marked = exemptCategory === null || exemptCategory === 'pending_authority_confirmation' || exemptCategory === 'health_medical' || exemptCategory === 'nurse_anm' || exemptCategory === 'ayush_medical' || exemptCategory === 'veterinary_staff' || exemptCategory === 'all_india_radio' || exemptCategory === 'doordarshan' || exemptCategory === 'bsnl_mtnl_ops';
+
+    await client.query(
+      `INSERT INTO personnel_exemptions
+         (personnel_id, employee_id, new_exempt_category, old_exempt_category, reason, requested_by_user_id, note)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, personnel.employee_id, exemptCategory, oldCategory, 'authority_mark', (req && req.session && req.session.user && req.session.user.id) || null, note]
+    );
+    await client.query(
+      `UPDATE personnel
+         SET exempt_category = $1
+         WHERE id = $2`,
+      [exemptCategory, id]
+    );
+    await client.query('COMMIT');
+    return { ok: true, id, profileId: personnel.id };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { persistPersonnelImport, patchPersonnelExemption, IMPORT_DISTRICT };
+

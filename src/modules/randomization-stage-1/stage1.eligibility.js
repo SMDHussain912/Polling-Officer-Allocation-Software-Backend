@@ -33,7 +33,7 @@
  *  - Female-officer-per-station rules (p.4) are Stage 2/appointment rules.
  */
 
-const { EXEMPT_CATEGORY, ALL_EXEMPT_CATEGORIES } = require('./stage1.constants');
+const { EXEMPT_CATEGORY, ALL_EXEMPT_CATEGORIES, PENDING_AUTHORITY_CONFIRMATION } = require('./stage1.constants');
 const { Stage1ValidationError } = require('./stage1.errors');
 
 /**
@@ -75,6 +75,15 @@ function isEligible(person, scope) {
     String(person.mandalId) !== String(scope.mandalId)
   ) {
     return { eligible: false, reason: 'outside_mandal_scope' };
+  }
+  // Pending authority confirmation (circular p.61(a)(vii) bank cases with
+  // unverifiable criteria, or manually flagged records): an UNRESOLVED state,
+  // not an exemption. Eligibility is NOT finalized for these records until
+  // the authority resolves them — rejected here regardless of any custom
+  // exemptCategories scope, so they can be neither silently drafted nor
+  // silently excluded.
+  if (person.exemptCategory === PENDING_AUTHORITY_CONFIRMATION) {
+    return { eligible: false, reason: 'pending_authority_confirmation' };
   }
   if (person.exemptCategory) {
     const exemptSet = scope.exemptCategories || ALL_EXEMPT_CATEGORIES;

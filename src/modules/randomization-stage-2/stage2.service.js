@@ -9,7 +9,9 @@ const duties = require('./stage2.duties');
 const { Stage2ValidationError } = require('./stage2.errors');
 const { validateStage2Request } = require('./stage2.validator');
 const { isMandalBarred } = require('./stage2.mandal');
+const { buildAdjacencyLookup } = require('./stage2.adjacency');
 const formation = require('./stage2.formation');
+const { MICRO_OBSERVER_ROLE, assignMicroObservers } = require('../randomization/micro-observer');
 
 /** Corrected Stage 2 rule (this submission):
  *   PO   = gazetted + presiding-eligible (e.g. Headmaster), roster slot 0,
@@ -88,6 +90,7 @@ function createStage2Service(deps) {
     const pool = t.options.useReserves === 'include' ? t.employees.slice() : required.slice();
     const electionShort = formation.electionShortOf(t.stage1Run.electionConfigurationId);
 
+
     // Single corrected formation path (1+1+4 party), no broken 2-phase fallback.
     const partySize = PRESIDING_OFFICERS_PER_PARTY + t.options.pollingOfficersPerParty;
     const formationResult = formation.formParties(pool, {
@@ -100,6 +103,61 @@ function createStage2Service(deps) {
 
     const parties = formationResult.parties.map(function (p, i) {
       const teamCode = formation.buildTeamCode(t.options.teamCodePrefix, electionShort, i + 1);
+    let parties = [];
+    let shortageParties = 0;
+    if (t.options.allowShortageFallback) {
+      // Two-phase: full 1+5 parties first, then 1+4 parties (merged 3rd+4th
+      // duty on ONE person) from whoever is left. partiesRequested caps the
+      // total across both phases.
+      const adjacency = buildAdjacencyLookup(t.options.mandalAdjacency);
+      const phased = formation.formPartiesWithFallback(pool, {
+        postings: t.options.postingMandals,
+        adjacency: adjacency.size > 0 ? adjacency : null,
+        randomInt: randomInt,
+        maxAttempts: maxAttempts,
+        allowShortageFallback: true,
+      });
+      const all = phased.full.parties.map(function (p) { return { raw: p, size: 6 }; })
+        .concat((phased.shortage ? phased.shortage.parties : []).map(function (p) {
+          return { raw: p, size: 5 };
+        }));
+      const capped = t.options.partiesRequested > 0 ? all.slice(0, t.options.partiesRequested) : all;
+      parties = capped.map(function (entry, i) {
+        const teamCode = formation.buildTeamCode(t.options.teamCodePrefix, electionShort, i + 1);
+        const postingMandal = entry.raw.posting ? String(entry.raw.posting.raw) : null;
+        const per = entry.size - PRESIDING_OFFICERS_PER_PARTY;
+        const members = entry.raw.members.map(function (m, idx) {
+          return {
+            role: formation.roleForSlot(idx, per),
+            duty: formation.dutyForSlot(idx, per),
+            personnelId: m.personnelId, name: m.name, designation: m.designation,
+            officeId: m.officeId, officeName: m.officeName,
+            seniorityRank: m.seniorityRank, classification: m.classification,
+          };
+        });
+        if (per === 4) shortageParties += 1;
+        return {
+          teamCode: teamCode, postingMandal: postingMandal, members: members,
+          teamSize: entry.size, shortageParty: per === 4,
+          shortageReason: per === 4 ? t.options.shortageReason : null,
+          presidingDutyNeedsConfirmation: duties.PRESIDING_DUTY_NEEDS_CONFIRMATION,
+        };
+      });
+      verifyMixedInvariants(t.employees, parties);
+    } else {
+      const partySize = PRESIDING_OFFICERS_PER_PARTY + t.options.pollingOfficersPerParty;
+      const adjacency = buildAdjacencyLookup(t.options.mandalAdjacency);
+      const result = formation.formParties(pool, {
+        partySize: partySize,
+        postings: t.options.postingMandals,
+        adjacency: adjacency.size > 0 ? adjacency : null,
+        randomInt: randomInt,
+        maxAttempts: maxAttempts,
+        partiesRequested: t.options.partiesRequested,
+      });
+      parties = result.parties.map(function (p, i) {
+        const teamCode = formation.buildTeamCode(t.options.teamCodePrefix, electionShort, i + 1);
+
       const postingMandal = p.posting ? String(p.posting.raw) : null;
       const members = p.members.map(function (m, idx) {
         return {
@@ -122,13 +180,96 @@ function createStage2Service(deps) {
 
     verifyMixedInvariants(t.employees, parties);
 
+      });
+      verifyInvariants(t.employees, parties, partySize);
+
+      // NOTE: one Micro Observer per party is assigned AFTER both formation
+      // paths below (full and shortage parties alike) — never silently skipped.
+      // No substitutes are added: teams are exactly the officers formed here.
+    }
+    // --- ONE Micro Observer per formed party (integrated into Stage 2). ----
+    // SOURCE (team decision 2026-10-15): a SEPARATE MO candidate list
+    // (bank staff uploaded via POST /api/imports/micro-observers) passed as
+    // options.moCandidates. When moCandidates is absent/empty, fall back to
+    // the legacy path (officer pool + designationRules microObserverEligible)
+    // so existing single-pool flows keep working.
+    var useSeparateMoPool = Array.isArray(t.options.moCandidates) && t.options.moCandidates.length > 0;
+    var moPool;
+    var moById;
+    if (useSeparateMoPool) {
+      moPool = t.options.moCandidates.map(function (c) {
+        return {
+          id: c.personnelId,
+          personnelId: c.personnelId,
+          name: c.name,
+          designation: c.designation,
+          officeId: c.officeId,
+          officeName: c.officeName,
+          workMandal: c.workMandal,
+          nativeMandal: c.nativeMandal,
+          seniorityRank: undefined,
+          classification: 'micro-observer',
+        };
+      });
+      moById = new Map(moPool.map(function (p) { return [String(p.id), p]; }));
+    } else {
+      moPool = t.employees.map(function (e) {
+      return {
+        id: e.personnelKey,
+        personnelId: e.personnelId,
+        name: e.name,
+        designation: e.designation,
+        officeId: e.officeId,
+        officeName: e.officeName,
+        workMandal: e.workMandal,
+        nativeMandal: e.nativeMandal,
+        seniorityRank: e.seniorityRank,
+        classification: e.classification,
+      };
+    });
+      moById = new Map(moPool.map(function (p) { return [String(p.id), p]; }));
+    }
+    // Separate-pool mode: every MO candidate is eligible by upload (the file
+    // IS the authority list); the circular's own mixing rules still apply
+    // (distinct office, no own-mandal). Legacy mode keeps the designationRules
+    // eligibility gate.
+    var moDesignationRules = useSeparateMoPool
+      ? {}
+      : ((t.options && t.options.designationRules) || {});
+    if (useSeparateMoPool) {
+      moPool.forEach(function (p) { moDesignationRules[p.designation] = { microObserverEligible: true }; });
+    }
+    var moPlan = assignMicroObservers({
+      parties: parties,
+      pool: moPool,
+      internalById: moById,
+      designationRules: moDesignationRules,
+      randomInt: randomInt,
+      required: true,
+    });
+    parties = moPlan.parties;
+    var microObserversAssigned = moPlan.assignedCount;
+
+    // excelRows: operational members + appended Micro Observer per party.
+    // Source rows stay resolved against full employee records; MO members
+    // from a SEPARATE uploaded pool resolve from the MO pool map instead
+    // (they were never officers, so t.employees cannot contain them).
+    var moSrcById = useSeparateMoPool
+      ? new Map(moPool.map(function (p) {
+        return [String(p.personnelId), {
+          personnelId: p.personnelId, name: p.name, designation: p.designation,
+          officeId: p.officeId, officeName: p.officeName,
+          seniorityRank: p.seniorityRank, classification: p.classification,
+        }];
+      }))
+      : new Map();
     const excelRows = formation.toExcelRows(parties.map(function (p) {
       return {
         teamCode: p.teamCode, postingMandal: p.postingMandal,
         members: p.members.map(function (m) {
           const src = t.employees.find(function (e) {
             return String(e.personnelId) === String(m.personnelId);
-          });
+          }) || moSrcById.get(String(m.personnelId));
           return {
             personnelId: m.personnelId, name: m.name, designation: m.designation,
             officeName: m.officeName, officeKey: src.officeKey,
@@ -153,6 +294,7 @@ function createStage2Service(deps) {
       };
     });
     const unmetRequirements = [];
+    (moPlan.unmetRequirements || []).forEach(function (u) { unmetRequirements.push(u); });
     if (t.options.partiesRequested > 0 && parties.length < t.options.partiesRequested) {
       unmetRequirements.push({
         code: 'PARTIES_SHORTFALL', requested: t.options.partiesRequested, formed: parties.length,
@@ -165,19 +307,28 @@ function createStage2Service(deps) {
     const complete = unmetRequirements.length === 0;
     const teamSizes = parties.map(function (p) { return p.members.length; });
     return {
-      status: complete ? STAGE2_STATUS.COMPLETED : STAGE2_STATUS.INCOMPLETE,
+      status: complete && unmetRequirements.length === 0 ? STAGE2_STATUS.COMPLETED : STAGE2_STATUS.INCOMPLETE,
       stage: STAGE_NUMBER, stage1RunId: t.stage1Run.runId,
       electionConfigurationId: t.stage1Run.electionConfigurationId,
       districtId: t.stage1Run.districtId,
       teamSize: teamSizes.length > 0 ? teamSizes[0] : null,
       teamSizes: teamSizes,
+
       fullParties: parties.filter(function (p) { return p.members.length === 5; }).length,
       observedPartySize: partySize,
       shortageParties: 0,
+
+      fullParties: parties.filter(function (p) { return (p.operationalSize || p.members.length) === 6; }).length,
+      shortageParties: parties.filter(function (p) { return (p.operationalSize || p.members.length) === 5; }).length,
+
       presidingOfficersPerParty: PRESIDING_OFFICERS_PER_PARTY,
       pollingOfficersPerParty: t.options.pollingOfficersPerParty,
       shortageReason: null,
       parties: parties, excelRows: excelRows, unassigned: unassigned,
+      microObserversAssigned: microObserversAssigned,
+      reserveHeld: reserveHeld.map(function (e) {
+        return { personnelId: e.personnelId, name: e.name, classification: e.classification };
+      }),
       unmetRequirements: unmetRequirements,
       counts: {
         poolSize: t.employees.length, requiredCount: required.length,

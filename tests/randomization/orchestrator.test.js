@@ -56,7 +56,12 @@ const designationRules = {
 };
 
 function baseInput() {
-  const all = [...personnel(18, 'Kakinada'), ...personnel(6, 'Pithapuram')];
+  // Pool math after MO integration: stage2 assigns ONE Micro Observer per
+  // party BEFORE drawing 20% substitutes, so the pool must cover operational
+  // (3 x 6 = 18) + MOs (3) + substitutes (3 x 2 = 6) = 27.
+  // Stage 1 supplies a 120% pool: requiredCount 18+5 = 23 -> 22+6 = 28 total
+  // (required 23 + reserve 5), enough for all three buckets with 1 spare.
+  const all = [...personnel(24, 'Kakinada'), ...personnel(12, 'Pithapuram')];
   const officeIdOverrides = {};
   all.forEach(function (p, i) {
     officeIdOverrides[p.employee_id] = 'SCHOOL-' + String(i + 1).padStart(2, '0');
@@ -70,8 +75,8 @@ function baseInput() {
       districtId: 'Kakinada',
       status: 'ready_for_randomization',
       requiredStrength: [
-        { mandalId: 'Kakinada', requiredCount: 15 }, // 120% = 18 exactly
-        { mandalId: 'Pithapuram', requiredCount: 5 }, // 120% = 6 exactly
+        { mandalId: 'Kakinada', requiredCount: 18 }, // 120% -> ceil(18 x 1.2) = 22 of 24 input
+        { mandalId: 'Pithapuram', requiredCount: 5 }, // 120% -> ceil(5 x 1.2) = 6 of 12 input (28-pool)
       ],
     },
     designationRules: { ...designationRules }, // clone: tests mutate safely
@@ -85,14 +90,16 @@ function baseInput() {
 test('full chain: Stage 1 -> Stage 2 -> Stage 3 succeeds', async () => {
   const out = await runAllocation(baseInput());
 
-  // Stage 1: 120% pool incl. reserves (15+5 required -> 18+6 pool).
+  // Stage 1: 120% pool sized for teams + MOs + substitutes below: 18+5
+  // required over a 28-person pool (22 + 6 selected incl. reserves).
   assert.equal(out.stage1.stage, 1);
   assert.equal(out.stage1.status, 'completed');
-  assert.equal(out.stage1.results.length, 24, 'pool = 18 + 6 (120%)');
   const required = out.stage1.results.filter((r) => r.classification === 'required');
   const reserve = out.stage1.results.filter((r) => r.classification === 'reserve');
-  assert.equal(required.length, 20, 'required = 15 + 5');
-  assert.equal(reserve.length, 4, 'reserve = 20% of required');
+  assert.equal(out.stage1.results.length, 28, 'pool = 22 + 6 (120%)');
+  assert.equal(required.length, 23, 'required = 18 + 5');
+  assert.equal(reserve.length, 5, 'reserve = 20% of required (rounded per mandal)');
+
 
   // Stage 2: parties formed from the pool, each with a teamCode.
   assert.equal(out.stage2.stage, 2);
@@ -132,6 +139,33 @@ test('full chain: Stage 1 -> Stage 2 -> Stage 3 succeeds', async () => {
 
   // Audit trail recorded Stage 1 execution.
   assert.ok(out.auditEvents.length > 0, 'audit events recorded');
+});
+
+test('separate MO upload: MOs drawn from moRows (bank staff), substitutes officer-only', async () => {
+  const input = baseInput();
+  // Bank-staff MO upload: 3 candidates (one per party), distinct banks so
+  // the distinct-office rule is satisfiable, mandals far from postings.
+  input.moRows = [
+    { employee_id: 'BANK-001', employee_name: 'Bank Officer 1', designation: 'Assistant Manager', bank_name: 'APGB', working_mandal: 'Amadaguru', native_mandal: 'Amadaguru', residence_mandal: 'Amadaguru' },
+    { employee_id: 'BANK-002', employee_name: 'Bank Officer 2', designation: 'Clerk', bank_name: 'SBI', working_mandal: 'Bukkapatnam', native_mandal: 'Bukkapatnam', residence_mandal: 'Bukkapatnam' },
+    { employee_id: 'BANK-003', employee_name: 'Bank Officer 3', designation: 'Officer', bank_name: 'Canara', working_mandal: 'Nallacheruvu', native_mandal: 'Nallacheruvu', residence_mandal: 'Nallacheruvu' },
+  ];
+  const out = await runAllocation(input);
+
+  assert.equal(out.stage2.parties.length, 3);
+  const bankIds = new Set(['BANK-001', 'BANK-002', 'BANK-003']);
+  for (const p of out.stage2.parties) {
+    const mos = p.members.filter((m) => m.isMicroObserver === true);
+    assert.equal(mos.length, 1, p.teamCode + ' must have exactly one MO');
+    assert.ok(bankIds.has(String(mos[0].personnelId)), p.teamCode + ' MO must be bank staff, got ' + mos[0].personnelId);
+    // Substitutes are officer-only: ranked EMP- ids, never BANK- ids.
+    for (const s of p.substitutes || []) {
+      assert.ok(!bankIds.has(String(s.personnelId)), 'substitute must never be bank MO staff');
+      assert.ok(/^EMP-/.test(String(s.personnelId)), 'substitute must be an officer, got ' + s.personnelId);
+    }
+  }
+  assert.equal(out.stage2.microObserversAssigned, 3);
+  assert.equal(out.stage2.status, 'completed');
 });
 
 test('fails closed when designationRules lack a used designation', async () => {

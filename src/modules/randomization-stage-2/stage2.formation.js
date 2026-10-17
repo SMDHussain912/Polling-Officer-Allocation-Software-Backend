@@ -135,12 +135,22 @@ function tryFormOnce(pool, partySize, postings, randomInt, startIndex, apoDesign
 }
 
 function formParties(pool, opts) {
-  const partySize = opts.partySize;
-  const postings = opts.postings || [];
+  opts = opts || {};
+  const partySize = opts.partySize || 6;
+  const postings = Array.isArray(opts.postings) ? opts.postings : [];
+  const adjacency = opts.adjacency || null; // stage2.adjacency lookup or null
   const randomInt = checkRandomInt(opts.randomInt);
   const maxAttempts = opts.maxAttempts || 50;
   const partiesRequested = opts.partiesRequested || 0;
   const apoDesignation = opts.apoDesignation;
+
+  // --- Near-mandal mode: pick each party's posting FIRST (random among
+  // candidates), then fill members that may all serve there. A party's duty
+  // mandal must lie in near(work)/near(native) of EVERY member and in none
+  // of their own mandals.
+  if (adjacency && adjacency.size > 0 && postings.length > 0) {
+    return formPartiesNearMandal(pool, partySize, postings, adjacency, randomInt, partiesRequested, maxAttempts);
+  }
 
   let best = { parties: [], unassigned: pool.slice() };
   for (let a = 0; a < maxAttempts; a += 1) {
@@ -174,6 +184,7 @@ function formPartiesWithFallback(pool, opts) {
   const full = formParties(pool, {
     partySize: 6,
     postings: opts.postings,
+    adjacency: opts.adjacency || null,
     randomInt: opts.randomInt,
     maxAttempts: opts.maxAttempts,
     partiesRequested: 0,
@@ -188,6 +199,7 @@ function formPartiesWithFallback(pool, opts) {
   const shortage = formParties(leftover, {
     partySize: 5,
     postings: [],
+    adjacency: null,
     randomInt: opts.randomInt,
     maxAttempts: opts.maxAttempts,
     partiesRequested: 0,
@@ -253,6 +265,79 @@ function toExcelRows(parties) {
     });
   }
   return rows;
+}
+
+
+/**
+ * Near-mandal formation: for each party, cycle shuffled candidate postings and
+ * take the first posting with a fillable crew (near-eligible PO + members,
+ * distinct offices, PO senior). Whole-run retries keep the best (most
+ * parties) attempt. Never relaxes: shortfall -> unassigned.
+ */
+function formPartiesNearMandal(pool, partySize, postings, adjacency, randomInt, partiesRequested, maxAttempts) {
+  const adj = require('./stage2.adjacency');
+  let best = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const avail = pool.slice();
+    shuffleInPlace(avail, randomInt);
+    const postingOrder = postings.slice();
+    shuffleInPlace(postingOrder, randomInt);
+    const parties = [];
+    const used = new Set();
+    const wanted = partiesRequested > 0 ? partiesRequested : Number.MAX_SAFE_INTEGER;
+    let cursor = 0;
+    let idleCycles = 0;
+    while (parties.length < wanted) {
+      if (avail.every(function (e) { return used.has(e.personnelKey); })) break;
+      if (cursor >= postingOrder.length * 6) break; // bounded scan per attempt
+      const posting = postingOrder[cursor % postingOrder.length];
+      cursor += 1;
+      const poCands = avail.filter(function (e) {
+        return e.presidingEligible && !used.has(e.personnelKey) &&
+          adj.eligiblePostingMandals([e], [posting], adjacency).length > 0;
+      });
+      if (poCands.length === 0) { idleCycles += 1; continue; }
+      shuffleInPlace(poCands, randomInt);
+      let placed = false;
+      for (const po of poCands) {
+        const members = [po];
+        const usedOffices = new Set([po.officeKey]);
+        const rest = avail.filter(function (e) {
+          return !used.has(e.personnelKey) && e.personnelKey !== po.personnelKey &&
+            adj.eligiblePostingMandals([e], [posting], adjacency).length > 0;
+        });
+        shuffleInPlace(rest, randomInt);
+        for (const cand of rest) {
+          if (members.length >= partySize) break;
+          if (usedOffices.has(cand.officeKey)) continue;
+          if (!(po.seniorityRank < cand.seniorityRank)) continue;
+          members.push(cand);
+          usedOffices.add(cand.officeKey);
+        }
+        if (members.length === partySize && partyIsValid(members)) {
+          members.forEach(function (m) { used.add(m.personnelKey); });
+          parties.push({ members: members, posting: posting });
+          placed = true;
+          idleCycles = 0;
+          break;
+        }
+      }
+      if (!placed) idleCycles += 1;
+      if (idleCycles > postingOrder.length * 2) break;
+    }
+    const unassigned = avail.filter(function (e) { return !used.has(e.personnelKey); });
+    const result = { parties: parties, unassigned: unassigned };
+    if (!best || result.parties.length > best.parties.length) best = result;
+    if (result.unassigned.length === 0 && !partiesRequested) return result;
+    if (partiesRequested && best.parties.length >= partiesRequested) {
+      best.parties = best.parties.slice(0, partiesRequested);
+      const usedKeys = new Set();
+      best.parties.forEach(function (x) { x.members.forEach(function (m) { usedKeys.add(m.personnelKey); }); });
+      best.unassigned = pool.filter(function (e) { return !usedKeys.has(e.personnelKey); });
+      return best;
+    }
+  }
+  return best || { parties: [], unassigned: pool.slice() };
 }
 
 module.exports = {
