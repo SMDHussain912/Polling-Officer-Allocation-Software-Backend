@@ -32,7 +32,7 @@ function createStage3Service(deps) {
 
   function executeMapping(input) {
     const t = validateStage3Request(input);
-    const result = mapping.mapTeamsToStations(t.parties, t.pollingStations, randomInt);
+    const result = mapping.mapTeamsToStations(t.parties, t.pollingStations, randomInt, t.options.maxAttempts);
 
     const unmetRequirements = result.unmetRequirements.slice();
     const complete = unmetRequirements.length === 0;

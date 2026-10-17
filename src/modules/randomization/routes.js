@@ -48,7 +48,7 @@ router.use(authorize('authority', 'admin'));
 // never selected here (same policy as the personnel read endpoint).
 const PERSONNEL_COLUMNS =
   'employee_id, employee_name, designation, is_active, district, ' +
-  'work_mandal, native_mandal, exempt_category, import_batch_id';
+  'work_mandal, native_mandal, gazetted_status, exempt_category, import_batch_id';
 
 router.post('/run', async (req, res) => {
   try {

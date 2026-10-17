@@ -179,3 +179,41 @@ test('publish refuses an incomplete mapping and a double publish', () => {
   const once = svc.publish(done);
   assert.throws(() => svc.publish(once), (e) => e instanceof Stage3UnresolvedRuleError);
 });
+
+test('duty mandal must differ from every member work/native mandal', () => {
+  // Member A: work_mandal=M1, nativeMandal=M2 (blocked from M1/M2)
+  // Member B: work_mandal=M2, nativeMandal=M3 (blocked from M2/M3)
+  // Member C: work_mandal=M3, nativeMandal=M4 (blocked from M3/M4)
+  const compliantParty = {
+    teamCode: 'PP-1', teamSize: 3, postingMandal: 'M1',
+    members: [
+      { personnelId: 'E1', name: 'A', workMandal: 'M1', nativeMandal: 'M2' },
+      { personnelId: 'E2', name: 'B', workMandal: 'M2', nativeMandal: 'M3' },
+      { personnelId: 'E3', name: 'C', workMandal: 'M3', nativeMandal: 'M4' },
+    ],
+  };
+  const blockedParty = {
+    teamCode: 'PP-2', teamSize: 3, postingMandal: 'M9',
+    members: [
+      { personnelId: 'E4', name: 'D', workMandal: 'M9', nativeMandal: 'M1' },
+      { personnelId: 'E5', name: 'E', workMandal: 'M9', nativeMandal: 'M2' },
+      { personnelId: 'E6', name: 'F', workMandal: 'M9', nativeMandal: 'M3' },
+    ],
+  };
+  const stations = [
+    { stationId: 'PS-1', stationCode: 'A1', mandal: 'M5' },
+    { stationId: 'PS-2', stationCode: 'A2', mandal: 'M9' }, // blocked by E4/E5/E6
+    { stationId: 'PS-3', stationCode: 'A3', mandal: 'M1' }, // blocked by E1/E4
+  ];
+
+  const svc = stage3.createStage3Service({ randomInt: seededRandom(123) });
+  const res = svc.executeMapping({
+    stage2Run: { stage: 2, runId: 'r2', stage1RunId: 'r1', electionConfigurationId: 'ec', districtId: 'D', status: 'completed', parties: [compliantParty, blockedParty] },
+    pollingStations: stations,
+  });
+  // compliantParty should be assignable; blockedParty should fail the mandal rule.
+  assert.equal(res.status, 'incomplete');
+  const compliant = res.assignments.find((a) => a.teamCode === 'PP-1');
+  assert.ok(compliant, 'compliant party should be assigned');
+  assert.equal(compliant.stationId, 'PS-1', 'compliant party must map to a compatible station');
+});

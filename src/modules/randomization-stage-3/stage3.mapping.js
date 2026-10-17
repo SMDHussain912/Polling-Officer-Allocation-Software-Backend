@@ -46,49 +46,91 @@ function checkRandomInt(fn) {
  * `assignments` entries carry ONLY teamCode + station identity + the
  * confidential publication state — never personnel or sensitive fields.
  */
-function mapTeamsToStations(parties, pollingStations, randomInt) {
+function mapTeamsToStations(parties, pollingStations, randomInt, maxAttempts) {
   const rand = checkRandomInt(randomInt);
-  const shuffledParties = shuffleInPlace(parties.slice(), rand);
-  const shuffledStations = shuffleInPlace(pollingStations.slice(), rand);
+  const attempts = maxAttempts || 50;
+  const { normalizeMandal: mandalNormalize } = require('./stage3.mandal');
 
-  const pairCount = Math.min(shuffledParties.length, shuffledStations.length);
-  const assignments = [];
-  for (let i = 0; i < pairCount; i += 1) {
-    const party = shuffledParties[i];
-    const station = shuffledStations[i];
-    assignments.push({
-      teamCode: party.teamCode,
-      teamSize: party.teamSize,
-      postingMandal: party.postingMandal,
-      stationId: station.stationId,
-      stationCode: station.stationCode,
-      stationMandal: station.mandal,
-      publicationStatus: PUBLICATION_STATUS.CONFIDENTIAL,
-    });
+  // Retry until a valid station↔team bijection is found, where the station's
+  // mandal differs from EVERY member's work_mandal and native_mandal.
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const shuffledParties = shuffleInPlace(parties.slice(), rand);
+    const shuffledStations = shuffleInPlace(pollingStations.slice(), rand);
+
+    const pairCount = Math.min(shuffledParties.length, shuffledStations.length);
+    const assignments = [];
+    let allValid = true;
+
+    for (let i = 0; i < pairCount; i += 1) {
+      const party = shuffledParties[i];
+      const station = shuffledStations[i];
+      const stationMandal = mandalNormalize(station.mandal);
+
+      // Constraint: duty mandal (station's mandal) must differ from each member's
+      // working and native mandal. If ANY member is barred, this pairing fails.
+      // Parties without explicit member mandals pass through (no info to verify).
+      let partyCompatible = true;
+      const members = party.members || [];
+      for (let j = 0; j < members.length; j += 1) {
+        const m = members[j];
+        const memberMandal = mandalNormalize(m.workMandal || m.work_mandal);
+        const memberNative = mandalNormalize(m.nativeMandal || m.native_mandal);
+        if (stationMandal === memberMandal || stationMandal === memberNative) {
+          partyCompatible = false;
+          break;
+        }
+      }
+
+      if (!partyCompatible) {
+        allValid = false;
+        break;
+      }
+
+      assignments.push({
+        teamCode: party.teamCode,
+        teamSize: party.teamSize,
+        postingMandal: party.postingMandal,
+        stationId: station.stationId,
+        stationCode: station.stationCode,
+        stationMandal: station.mandal,
+        publicationStatus: PUBLICATION_STATUS.CONFIDENTIAL,
+      });
+    }
+
+    if (allValid) {
+      const unmetRequirements = [];
+      if (shuffledParties.length > shuffledStations.length) {
+        const surplus = shuffledParties.slice(pairCount).map(function (p) { return p.teamCode; });
+        unmetRequirements.push({
+          code: 'TEAMS_WITHOUT_STATION',
+          count: surplus.length,
+          teamCodes: surplus,
+          message: 'More polling parties than polling stations. Surplus handling is unresolved; ' +
+            'no party was force-assigned.',
+        });
+      } else if (shuffledStations.length > shuffledParties.length) {
+        const unstaffed = shuffledStations.slice(pairCount).map(function (s) { return s.stationId; });
+        unmetRequirements.push({
+          code: 'STATIONS_WITHOUT_TEAM',
+          count: unstaffed.length,
+          stationIds: unstaffed,
+          message: 'More polling stations than polling parties. Deficit handling is unresolved; ' +
+            'no station was double-staffed.',
+        });
+      }
+      return { assignments: assignments, unmetRequirements: unmetRequirements };
+    }
   }
 
-  const unmetRequirements = [];
-  if (shuffledParties.length > shuffledStations.length) {
-    const surplus = shuffledParties.slice(pairCount).map(function (p) { return p.teamCode; });
-    unmetRequirements.push({
-      code: 'TEAMS_WITHOUT_STATION',
-      count: surplus.length,
-      teamCodes: surplus,
-      message: 'More polling parties than polling stations. Surplus handling is unresolved; ' +
-        'no party was force-assigned.',
-    });
-  } else if (shuffledStations.length > shuffledParties.length) {
-    const unstaffed = shuffledStations.slice(pairCount).map(function (s) { return s.stationId; });
-    unmetRequirements.push({
-      code: 'STATIONS_WITHOUT_TEAM',
-      count: unstaffed.length,
-      stationIds: unstaffed,
-      message: 'More polling stations than polling parties. Deficit handling is unresolved; ' +
-        'no station was double-staffed.',
-    });
-  }
-
-  return { assignments: assignments, unmetRequirements: unmetRequirements };
+  // No valid bijection found within maxAttempts.
+  return {
+    assignments: [],
+    unmetRequirements: [{
+      code: 'NO_VALID_STATION_ASSIGNMENT',
+      count: parties.length,
+      message: 'No polling station satisfies the duty-mandala ≠ work/native-mandala rule for all teams.',
+    }],
+  };
 }
 
 module.exports = {

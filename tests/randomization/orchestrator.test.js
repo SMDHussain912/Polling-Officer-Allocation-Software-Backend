@@ -13,14 +13,22 @@ const { runAllocation } = require('../../src/modules/randomization/orchestrator'
 function personnel(count, mandal) {
   const rows = [];
   for (let i = 0; i < count; i += 1) {
+    // 3-tier gazetted split matching the new PO/APO/OPO rule:
+    //   i%6===0 -> Headmaster   (Gazetted,     rank 1, PO-eligible)
+    //   i%6===1 -> School Asst  (Gazetted,     rank 3, APO slot)
+    //   else    -> Teacher      (Non-Gazetted, rank 5, OPO slots)
+    const mod = i % 6;
+    const designation = mod === 0 ? 'Headmaster'
+      : mod === 1 ? 'School Assistant' : 'Teacher';
     rows.push({
       employee_id: 'EMP-' + mandal.slice(0, 3).toUpperCase() + '-' + String(i + 1).padStart(3, '0'),
       employee_name: 'Officer ' + mandal + ' ' + (i + 1),
-      designation: i % 4 === 0 ? 'School Assistant' : 'Teacher',
+      designation: designation,
       is_active: true,
       district: 'Kakinada',
       work_mandal: mandal,
       native_mandal: 'Anaparthi',
+      gazetted_status: mod <= 1 ? 'Gazetted' : 'Non-Gazetted',
       exempt_category: null,
     });
   }
@@ -40,8 +48,10 @@ function stations(count, mandal) {
 }
 
 const designationRules = {
-  // Lower rank = more senior. PO must be strictly more senior than officers.
-  'School Assistant': { seniorityRank: 1, presidingEligible: true, microObserverEligible: true },
+  // Lower rank = more senior. PO (Headmaster) strictly more senior than
+  // APO (School Assistant), who is more senior than OPOs (Teachers).
+  Headmaster: { seniorityRank: 1, presidingEligible: true, microObserverEligible: true },
+  'School Assistant': { seniorityRank: 3, presidingEligible: false, microObserverEligible: true },
   Teacher: { seniorityRank: 5, presidingEligible: false, microObserverEligible: true },
 };
 
@@ -146,7 +156,8 @@ test('fails closed when no Micro Observer is eligible', async () => {
   const input = baseInput();
   // Strip MO eligibility from every designation -> no MO can be placed.
   input.designationRules = {
-    'School Assistant': { seniorityRank: 1, presidingEligible: true, microObserverEligible: false },
+    Headmaster: { seniorityRank: 1, presidingEligible: true, microObserverEligible: false },
+    'School Assistant': { seniorityRank: 3, presidingEligible: false, microObserverEligible: false },
     Teacher: { seniorityRank: 5, presidingEligible: false, microObserverEligible: false },
   };
   const out = await runAllocation(input);

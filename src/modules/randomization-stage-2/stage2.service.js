@@ -51,6 +51,8 @@ function createStage2Service(deps) {
             duty: formation.dutyForSlot(idx, per),
             personnelId: m.personnelId, name: m.name, designation: m.designation,
             officeId: m.officeId, officeName: m.officeName,
+            workMandal: m.workMandal, nativeMandal: m.nativeMandal,
+            gazettedStatus: m.gazettedStatus,
             seniorityRank: m.seniorityRank, classification: m.classification,
           };
         });
@@ -81,6 +83,8 @@ function createStage2Service(deps) {
           duty: formation.dutyForSlot(idx, t.options.pollingOfficersPerParty),
           personnelId: m.personnelId, name: m.name, designation: m.designation,
           officeId: m.officeId, officeName: m.officeName,
+          workMandal: m.workMandal, nativeMandal: m.nativeMandal,
+          gazettedStatus: m.gazettedStatus,
           seniorityRank: m.seniorityRank, classification: m.classification,
         };
       });
@@ -166,11 +170,11 @@ function createStage2Service(deps) {
     // 5 (1+4 shortage with merged 3rd+4th duty on ONE person). Expected
     // roles: 1+5 -> Presiding,1st,2nd,3rd,4th,5th; 1+4 -> Presiding,1st,2nd,
     // 3rd(merged),5th with NO 4th role. Anything else fails closed.
-    const expected6 = ['Presiding Officer', '1st Polling Officer',
-      '2nd Polling Officer', '3rd Polling Officer', '4th Polling Officer',
-      '5th Polling Officer'];
-    const expected5 = ['Presiding Officer', '1st Polling Officer',
-      '2nd Polling Officer', '3rd Polling Officer', '5th Polling Officer'];
+    const expected6 = ['Presiding Officer', 'Assistant Polling Officer',
+      '1st Polling Officer', '2nd Polling Officer', '3rd Polling Officer',
+      '4th Polling Officer'];
+    const expected5 = ['Presiding Officer', 'Assistant Polling Officer',
+      '1st Polling Officer', '2nd Polling Officer', '5th Polling Officer'];
     const poolKeys = new Set(allEmployees.map(function (e) { return e.personnelKey; }));
     const byKey = {};
     allEmployees.forEach(function (e) { byKey[e.personnelKey] = e; });
@@ -191,6 +195,20 @@ function createStage2Service(deps) {
       const offices = new Set();
       const po = byKey[String(p.members[0].personnelId)];
       if (!po || po.presidingEligible !== true) throw new Stage2ValidationError('PO not eligible: ' + p.teamCode + '.');
+      // Gazetted rule: PO (slot 0) and APO (slot 1) must be gazetted; OPOs (slots 2+) non-gazetted.
+      if (p.members[0].gazettedStatus && String(p.members[0].gazettedStatus).trim().toLowerCase() !== 'gazetted') {
+        throw new Stage2ValidationError('PO must be gazetted: ' + p.teamCode + '.');
+      }
+      for (let gi = 1; gi < p.members.length; gi += 1) {
+        const gm = p.members[gi];
+        if (gm.gazettedStatus && String(gm.gazettedStatus).trim().toLowerCase() === 'gazetted') {
+          if (gi === 1) continue; // slot 1 = APO (gazetted)
+          throw new Stage2ValidationError('OPO must be non-gazetted: ' + p.teamCode + '.');
+        } else {
+          if (gi >= 2) continue; // slots 2+ = OPO (non-gazetted)
+          throw new Stage2ValidationError('APO must be gazetted: ' + p.teamCode + '.');
+        }
+      }
       for (const m of p.members) {
         const key = String(m.personnelId);
         if (!poolKeys.has(key)) throw new Stage2ValidationError('Outside pool: ' + key + '.');
@@ -225,6 +243,20 @@ function createStage2Service(deps) {
       const offices = new Set();
       const po = byKey[String(p.members[0].personnelId)];
       if (!po || po.presidingEligible !== true) throw new Stage2ValidationError('PO not eligible: ' + p.teamCode + '.');
+      // Gazetted rule: PO (slot 0) and APO (slot 1) must be gazetted; OPOs (slots 2+) non-gazetted.
+      if (p.members[0].gazettedStatus && String(p.members[0].gazettedStatus).trim().toLowerCase() !== 'gazetted') {
+        throw new Stage2ValidationError('PO must be gazetted: ' + p.teamCode + '.');
+      }
+      for (let gi = 1; gi < p.members.length; gi += 1) {
+        const gm = p.members[gi];
+        if (gm.gazettedStatus && String(gm.gazettedStatus).trim().toLowerCase() === 'gazetted') {
+          if (gi === 1) continue; // slot 1 = APO (gazetted)
+          throw new Stage2ValidationError('OPO must be non-gazetted: ' + p.teamCode + '.');
+        } else {
+          if (gi >= 2) continue; // slots 2+ = OPO (non-gazetted)
+          throw new Stage2ValidationError('APO must be gazetted: ' + p.teamCode + '.');
+        }
+      }
       for (const m of p.members) {
         const key = String(m.personnelId);
         if (!poolKeys.has(key)) throw new Stage2ValidationError('Outside pool: ' + key + '.');

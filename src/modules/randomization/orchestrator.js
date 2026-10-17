@@ -27,6 +27,7 @@ function toInternalPersonnel(p, departmentName) {
     mandalId: p.work_mandal,              // Stage 1 mandal scope + Stage 2 workMandal
     workMandal: p.work_mandal,
     nativeMandal: p.native_mandal,
+    gazettedStatus: p.gazetted_status || null,
     exemptCategory: p.exempt_category || null,
     officeId: officeId,
     officeName: officeId,
@@ -80,6 +81,7 @@ function buildEmployees(selectedResults, internalById, designationRules) {
       officeName: p.officeName,
       workMandal: p.workMandal,
       nativeMandal: p.nativeMandal,
+      gazettedStatus: p.gazettedStatus,
       mandalId: p.mandalId,
       seniorityRank: rule ? rule.seniorityRank : undefined,
       presidingEligible: rule ? rule.presidingEligible : undefined,

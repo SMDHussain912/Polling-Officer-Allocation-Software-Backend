@@ -65,6 +65,7 @@ const PRESIDING_OFFICERS_PER_PARTY = 1;
  */
 const TEAM_ROLES = Object.freeze({
   PRESIDING_OFFICER: 'Presiding Officer',
+  ASSISTANT_POLLING_OFFICER: 'Assistant Polling Officer',
   POLLING_OFFICER_1: '1st Polling Officer',
   POLLING_OFFICER_2: '2nd Polling Officer',
   POLLING_OFFICER_3: '3rd Polling Officer',

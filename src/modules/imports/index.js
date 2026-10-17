@@ -183,4 +183,31 @@ router.get('/batches/:id/personnel', authorize('staff', 'authority', 'admin'), a
   }
 });
 
+// ---- Training: PO / APO separate allocation (work_mandal based) ----
+
+const { requireAuth, authorize } = require('../../middleware/auth');
+const { buildTrainingBatches } = require('./po_apo.allocator');
+
+router.get('/training/po-apo-batches', authorize('authority', 'admin'), async (req, res) => {
+  try {
+    // Stage 2 output (PO + APO) with work_mandal per member, joined by teamCode.
+    // In production this would read the durable Stage 2 tables; for now we
+    // return the latest in-memory run's parties.
+    const run = require('../../randomization/allocation-store').getLastRun();
+    const parties = (run && run.stage2 && run.stage2.parties) || [];
+
+    // Optional venue override: map work_mandal -> venue (from authoritative source).
+    const venueMap = req.query.venueMap
+      ? JSON.parse(String(req.query.venueMap))
+      : {};
+
+    const { poBatches, apoBatches } = buildTrainingBatches(parties, venueMap);
+
+    res.json({ ok: true, poBatches, apoBatches });
+  } catch (err) {
+    console.error('list training po/apo batches failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to list training batches' });
+  }
+});
+
 module.exports = router;
