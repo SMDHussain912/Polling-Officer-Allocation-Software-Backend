@@ -429,6 +429,30 @@ async function getIdCardDesign() {
   }
 }
 
+async function replaceMandalAdjacency({ buffer }) {
+  const { parseMandalAdjacency } = require('./intake');
+  const { accepted, rejected } = parseMandalAdjacency(buffer);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM mandal_adjacency');
+    for (const r of accepted) {
+      await client.query(
+        `INSERT INTO mandal_adjacency (mandal_name, near_mandal_names, updated_at)
+         VALUES ($1, $2::text[], now())`,
+        [r.mandal_name, r.near_mandal_names]
+      );
+    }
+    await client.query('COMMIT');
+    return { totalRows: accepted.length + rejected.length, acceptedRows: accepted.length, rejectedRows: rejected.length, rejected };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function replaceTrainingSessions({ buffer, createdBy }) {
   const { parseTrainingSessions } = require('./intake');
   const { accepted, rejected } = parseTrainingSessions(buffer);
@@ -461,6 +485,7 @@ module.exports = {
   replaceMicroObservers,
   replaceTrainingLocations,
   replaceTrainingSessions,
+  replaceMandalAdjacency,
   replaceRequirements,
   createTrainingBatches,
   clearTrainingBatches,

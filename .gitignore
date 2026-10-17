@@ -1,2 +1,5 @@
 node_modules
 .env
+
+# Generated training orders (server-side print copies)
+generated-documents/

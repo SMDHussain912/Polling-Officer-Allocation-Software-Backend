@@ -45,10 +45,20 @@ function normalizeCell(value) {
 }
 
 /** Read first sheet as array-of-arrays (.xlsx / .xls / .csv buffers). */
+/* Read first sheet as array-of-arrays (.xlsx / .xls / .csv buffers). */
 function readGrid(buffer) {
+  let data;
+  if (buffer instanceof Buffer) {
+    data = buffer;
+  } else if (typeof buffer === 'string') {
+    data = require('fs').readFileSync(buffer);
+  } else {
+    throw new BallotParseError('Ballot register file could not be read.');
+  }
+  const XLSX = require('xlsx');
   let workbook;
   try {
-    workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true, raw: false });
+    workbook = XLSX.read(data, { type: 'buffer', cellDates: true, raw: false });
   } catch (err) {
     throw new BallotParseError('File could not be read as an Excel workbook.');
   }
@@ -72,22 +82,26 @@ function readGrid(buffer) {
  */
 function mapHeader(grid) {
   const candidates = {
-    ballotId: ['boothid', 'ballotid', 'ballotno', 'ballotnumber', 'ballot'],
+    ballotId: ['boothid', 'ballotid', 'ballotno', 'ballotnumber', 'ballot',
+      'station_id', 'stationid', 'station', 'unit', 'pollingstationnumber',
+      'chartno'],
     psNo: ['boothnumber', 'psno', 'psnumber', 'pollingstationnumber',
-      'pollingstation', 'ballotunit', 'unit'],
+      'pollingstation', 'ballotunit', 'unit', 'station_number',
+      'station_name', 'pollingstationname'],
     mandal: ['mandalname', 'mandal'],
   };
   for (let i = 0; i < grid.length; i += 1) {
     const row = grid[i] || [];
     const colMap = {};
-    row.forEach((cell, col) => {
-      const h = normalizeHeader(cell);
-      if (!h) return;
+    for (let col = 0; col < row.length; col += 1) {
+      const raw = row[col];
+      const h = normalizeHeader(raw);
+      if (!h) continue;
       for (const [field, aliases] of Object.entries(candidates)) {
         if (colMap[field] !== undefined) continue;
         if (aliases.some((a) => h === a || h.includes(a))) colMap[field] = col;
       }
-    });
+    }
     if (colMap.ballotId !== undefined || colMap.psNo !== undefined) {
       return { colMap, headerRow: i };
     }
@@ -185,6 +199,8 @@ function allocateBallots(args) {
 
 module.exports = {
   BallotParseError: BallotParseError,
-  parseBallotRegister: parseBallotRegister,
-  allocateBallots: allocateBallots,
+  readGrid,
+  mapHeader,
+  parseBallotRegister,
+  allocateBallots,
 };

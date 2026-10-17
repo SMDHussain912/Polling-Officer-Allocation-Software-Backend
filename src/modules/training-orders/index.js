@@ -28,33 +28,48 @@ const TABLES = Object.freeze({
     batches: 'po_training_batches',
     members: 'po_training_batch_members',
     orders: 'po_training_orders',
-    template: path.join(__dirname, '../../../docs/po-order-tagged.docx'),
+    template: path.join(__dirname, '../../../docs/PO_Training_Order.docx'),
   },
   APO: {
     batches: 'apo_training_batches',
     members: 'apo_training_batch_members',
     orders: 'apo_training_orders',
-    template: path.join(__dirname, '../../../docs/apo-order-tagged.docx'),
+    template: path.join(__dirname, '../../../docs/APO_Training_Order.docx'),
+  },
+  OPO: {
+    batches: 'opo_training_batches',
+    members: 'opo_training_batch_members',
+    orders: 'opo_training_orders',
+    template: path.join(__dirname, '../../../docs/OPO_Training_Order.docx'),
   },
 });
 
 function tablesFor(group) {
   const g = String(group || '').toUpperCase();
-  if (g !== 'PO' && g !== 'APO') {
-    const err = new Error('group must be PO or APO');
+  if (!TABLES[g]) {
+    const err = new Error('group must be PO, APO or OPO');
     err.statusCode = 400;
     throw err;
   }
   return TABLES[g];
 }
 
-/** Classify Stage-2 role → PO | APO | MO (skip). */
+/**
+ * Classify Stage-2 role → training group.
+ * Team rework: PO (slot 0), APO = the single Assistant Presiding Officer
+ * (slot 4, former ZPTC officer), OPO = the other four polling officers
+ * (slots 1/2/3/5 — Voter ID, Ink, MPTC, Incharge), MO = skipped.
+ */
 function classifyRole(role) {
-  const r = String(role || '').toLowerCase();
+  const r = String(role || '').toLowerCase().trim();
   if (r.includes('micro') && r.includes('observer')) return 'MO';
   if (r === 'mo' || r.startsWith('micro observer')) return 'MO';
+  // 4th Polling Officer slot = Assistant Presiding Officer.
+  if (/\b4th\b|\bfourth\b/.test(r)) return 'APO';
+  if (r.includes('assistant') || r.includes('asst')) return 'APO';
   if (r.includes('presid')) return 'PO';
-  return 'APO';
+  // 1st / 2nd / 3rd / 5th Polling Officers = Other Presiding Officers.
+  return 'OPO';
 }
 
 function shuffleInPlace(arr) {
@@ -94,10 +109,32 @@ function parseTrainingDate(raw) {
   return { dd: d || '', mm: m || '', yyyy: y || '', weekday };
 }
 
+/**
+ * Split TRAINING_TIME_FROM (e.g. "09:30" or "9:30 AM") into hour / minute /
+ * am-pm for the {{training_time_H}} / {{training_time_min}} /
+ * {{training_time_ampm}} template tags. 24h input is converted to 12h+ampm.
+ */
+function parseTrainingTime(timeFrom) {
+  const raw = String(timeFrom || '').trim();
+  if (!raw) return { h: '', min: '', ampm: '' };
+  const m = raw.match(/^(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)?$/);
+  if (!m) return { h: '', min: '', ampm: '' };
+  let h = Number(m[1]);
+  const min = m[2];
+  let ampm = (m[3] || '').toUpperCase();
+  if (!ampm) {
+    ampm = h >= 12 ? 'PM' : 'AM';
+  }
+  h = h % 12;
+  if (h === 0) h = 12;
+  return { h: String(h).padStart(2, '0'), min, ampm };
+}
+
 function envMergeDefaults() {
   const training = config.training || {};
   const orders = config.orders || {};
   const parsed = parseTrainingDate(training.date);
+  const time = parseTrainingTime(training.timeFrom);
   const year =
     config.electionYear ||
     parsed.yyyy ||
@@ -105,28 +142,39 @@ function envMergeDefaults() {
   const district = config.districtName || 'Kakinada';
   return {
     district,
+    date: config.orderDate || orders.pollingDateTime || '',
+    place: config.orderPlace || district,
     order_date: config.orderDate || orders.pollingDateTime || '',
     order_place: config.orderPlace || district,
     election_year: year,
-    training_dd: parsed.dd,
-    training_mm: parsed.mm,
-    training_yyyy: parsed.yyyy,
+    training_day: parsed.dd,
+    training_month: parsed.mm,
+    training_year: parsed.yyyy,
     training_weekday: parsed.weekday,
+    training_time_H: time.h,
+    training_time_min: time.min,
+    training_time_ampm: time.ampm,
+    training_venue: training.venue || '',
+    training_mandal: training.mandal || '',
     training_time_from: training.timeFrom || '',
     training_time_to: training.timeTo || '',
   };
 }
 
 /**
- * Wipe all PO + APO training batch/member/order rows (cascade members via FK).
+ * Wipe all PO + APO + OPO training batch/member/order rows (cascade members
+ * via FK).
  */
 async function wipeAllTraining(client) {
   await client.query('DELETE FROM po_training_orders');
   await client.query('DELETE FROM apo_training_orders');
+  await client.query('DELETE FROM opo_training_orders');
   await client.query('DELETE FROM po_training_batch_members');
   await client.query('DELETE FROM apo_training_batch_members');
+  await client.query('DELETE FROM opo_training_batch_members');
   await client.query('DELETE FROM po_training_batches');
   await client.query('DELETE FROM apo_training_batches');
+  await client.query('DELETE FROM opo_training_batches');
 }
 
 /**
@@ -136,14 +184,17 @@ async function wipeAllTraining(client) {
  */
 async function wipeAllData() {
   // Keep users/roles (auth) AND randomization source tables — wiping them
-  // destroys allocation_runs / stage2_team_members / stage3_assignments and
-  // makes Training show "No completed randomization run found" after allocate.
+  // destroys allocation_runs / team_rosters / team_roster_members /
+  // allocation_publications and makes Training show
+  // "No completed randomization run found" after allocate. The frozen roster
+  // is the single Stage 2/3 store; it must survive re-allocate wipes.
   const protectedTables = new Set([
     'users',
     'roles',
     'allocation_runs',
-    'stage2_team_members',
-    'stage3_assignments',
+    'allocation_publications',
+    'team_rosters',
+    'team_roster_members',
   ]);
   const { rows } = await pool.query(
     `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`
@@ -206,8 +257,17 @@ async function allocateTraining({ createdBy } = {}) {
         trainingGroup: r.training_group,
         // Stage 3 enrichment: officer's real duty station (mandal) + ballot ID
         // (station / venue code) from the published Stage-3 allotment.
-        dutyMandal: r.station_mandal || '',
-        venueCode: r.station_code || '',
+        dutyMandal: r.duty_mandal || r.station_mandal || '',
+        venueCode: r.venue_code || r.station_code || '',
+        // Frozen roster snapshot (migration 016): when present these are the
+        // run-time officer details; they make the member row self-contained
+        // even if the live personnel row is later edited or deleted.
+        rosterPersonnelId: r.personnel_id || null,
+        rosterName: r.name || null,
+        rosterDesignation: r.designation || null,
+        rosterDepartment: r.department_name || null,
+        rosterMobile: r.mobile_no || null,
+        rosterWorkMandal: r.work_mandal || null,
       }));
     }
   } catch (err) {
@@ -266,8 +326,8 @@ async function allocateTraining({ createdBy } = {}) {
     let dbState = null;
     try {
       const runs = await pool.query('SELECT COUNT(*)::int AS c FROM allocation_runs');
-      const s2m = await pool.query('SELECT COUNT(*)::int AS c FROM stage2_team_members');
-      const s3a = await pool.query('SELECT COUNT(*)::int AS c FROM stage3_assignments');
+      const srm = await pool.query('SELECT COUNT(*)::int AS c FROM team_roster_members');
+      const srt = await pool.query('SELECT COUNT(*)::int AS c FROM team_rosters');
       const lastRun = getLastRun();
       const jsonExcelRows = lastRun && lastRun.stage2 && Array.isArray(lastRun.stage2.excelRows)
         ? lastRun.stage2.excelRows.length
@@ -277,8 +337,8 @@ async function allocateTraining({ createdBy } = {}) {
         : (lastRun ? 0 : null);
       dbState = {
         allocationRunsRows: Number(runs.rows[0].c),
-        stage2TeamMembersRows: Number(s2m.rows[0].c),
-        stage3AssignmentsRows: Number(s3a.rows[0].c),
+        teamRosterMembersRows: Number(srm.rows[0].c),
+        teamRostersRows: Number(srt.rows[0].c),
         inMemoryRun: !!lastRun,
         inMemoryRunStage2ExcelRows: jsonExcelRows,
         inMemoryRunStage2Parties: jsonParties,
@@ -315,16 +375,15 @@ async function allocateTraining({ createdBy } = {}) {
     };
   }
 
-  const groups = { PO: [], APO: [] };
+  const groups = { PO: [], APO: [], OPO: [] };
   let skippedMo = 0;
   for (const row of teamRows) {
     // DB-table rows carry the stored training_group (classified at run time);
     // run-JSON rows are classified live. Both skip MO.
-    const kind = row.trainingGroup === 'PO' || row.trainingGroup === 'APO'
+    const stored = ['PO', 'APO', 'OPO'].includes(row.trainingGroup)
       ? row.trainingGroup
-      : row.trainingGroup === 'MO'
-        ? 'MO'
-        : classifyRole(row.role);
+      : null;
+    const kind = stored || (row.trainingGroup === 'MO' ? 'MO' : classifyRole(row.role));
     if (kind === 'MO') {
       skippedMo += 1;
       continue;
@@ -332,7 +391,7 @@ async function allocateTraining({ createdBy } = {}) {
     groups[kind].push(row);
   }
 
-  const allEmpIds = [...groups.PO, ...groups.APO].map((r) => r.employeeId);
+  const allEmpIds = [...groups.PO, ...groups.APO, ...groups.OPO].map((r) => r.employeeId);
   const client = await pool.connect();
   const batches = [];
   let unresolved = 0;
@@ -341,7 +400,7 @@ async function allocateTraining({ createdBy } = {}) {
     await wipeAllTraining(client);
     const personnelMap = await loadPersonnelByEmployeeIds(client, allEmpIds);
 
-    for (const group of ['PO', 'APO']) {
+    for (const group of ['PO', 'APO', 'OPO']) {
       const t = TABLES[group];
       const members = groups[group];
       if (members.length === 0) continue;
@@ -366,7 +425,11 @@ async function allocateTraining({ createdBy } = {}) {
           for (const officer of chunk) {
             const empKey = String(officer.employeeId || '').trim();
             const per = personnelMap.get(empKey);
-            if (!per) {
+            // Frozen roster (migration 016) carries the same ids/details at
+            // run time; use it when the live personnel row is gone (re-import,
+            // edit) so the training batch still records the officer.
+            const rosterId = officer.rosterPersonnelId || null;
+            if (!per && !rosterId) {
               unresolved += 1;
               continue;
             }
@@ -378,8 +441,8 @@ async function allocateTraining({ createdBy } = {}) {
                ON CONFLICT DO NOTHING`,
               [
                 batchId,
-                per.id,
-                per.employee_id,
+                per ? per.id : rosterId,
+                per ? per.employee_id : empKey || null,
                 officer.role || null,
                 officer.teamCode || null,
                 officer.dutyMandal || null,
@@ -441,21 +504,42 @@ async function listBatchMembers(group, batchId) {
   }
   const m = await pool.query(
     `SELECT m.personnel_id, m.employee_id, m.role, m.team_code,
-            p.employee_name, p.designation, p.native_mandal, p.work_mandal, p.mobile_no,
-            -- Stage 3 allotment: officer's real duty station + mandal (join via
-            -- team_code on the latest run that mapped this team).
-            a.station_code AS venue_code, a.station_mandal AS duty_mandal
+            COALESCE(rm.name, p.employee_name) AS employee_name,
+            COALESCE(rm.designation, p.designation) AS designation,
+            COALESCE(rm.native_mandal, p.native_mandal) AS native_mandal,
+            COALESCE(rm.work_mandal, p.work_mandal) AS work_mandal,
+            COALESCE(p.working_constituency_name, '') AS working_constituency_name,
+            COALESCE(rm.department_name, ib.department_name, '') AS department_name,
+            -- Pre-resolved print line: same officeAddressFor() rule the DOCX
+            -- merge uses (department -> "mandal Mandal, constituency" ->
+            -- mandal/constituency -> blank). Lets the Training page verify the
+            -- address before generating orders.
+            CASE
+              WHEN NULLIF(TRIM(COALESCE(rm.department_name, ib.department_name, '')), '') IS NOT NULL
+                THEN TRIM(COALESCE(rm.department_name, ib.department_name, ''))
+              WHEN NULLIF(TRIM(COALESCE(rm.work_mandal, p.work_mandal, '')), '') IS NOT NULL
+               AND NULLIF(TRIM(COALESCE(p.working_constituency_name, '')), '') IS NOT NULL
+               AND LOWER(TRIM(COALESCE(rm.work_mandal, p.work_mandal, ''))) <>
+                   LOWER(TRIM(COALESCE(p.working_constituency_name, '')))
+                THEN TRIM(COALESCE(rm.work_mandal, p.work_mandal, '')) || ' Mandal, ' ||
+                     TRIM(COALESCE(p.working_constituency_name, ''))
+              ELSE TRIM(
+                     COALESCE(NULLIF(TRIM(COALESCE(rm.work_mandal, p.work_mandal, '')), ''),
+                              NULLIF(TRIM(COALESCE(p.working_constituency_name, '')), ''),
+                              ''))
+            END AS working_office_address,
+            COALESCE(rm.mobile_no, p.mobile_no) AS mobile_no,
+            -- Stage 3 allotment: officer's real duty station + mandal from the
+            -- frozen roster of the latest run (migration 016).
+            rm.venue_code, rm.duty_mandal
        FROM ${t.members} m
-       JOIN personnel p ON p.id = m.personnel_id
-       LEFT JOIN LATERAL (
-         SELECT sa.station_code, sa.station_mandal
-           FROM stage3_assignments sa
-          WHERE sa.team_code = m.team_code
-          ORDER BY sa.run_id DESC
-          LIMIT 1
-       ) a ON TRUE
+       LEFT JOIN personnel p ON p.id = m.personnel_id
+       LEFT JOIN import_batches ib ON ib.id = p.import_batch_id
+       LEFT JOIN team_roster_members rm
+              ON rm.employee_id = m.employee_id
+             AND rm.run_id = (SELECT MAX(run_id) FROM team_roster_members)
       WHERE m.batch_id = $1
-      ORDER BY p.employee_name`,
+      ORDER BY COALESCE(rm.name, p.employee_name)`,
     [id]
   );
   return { group: String(group).toUpperCase(), batch: b.rows[0], members: m.rows };
@@ -535,9 +619,17 @@ async function assignBatchLocation(group, batchId, locationId) {
 }
 
 function officeAddressFor(per) {
+  // Working Office Address: department (import batch) when present, else the
+  // officer's working mandal + working constituency (both frozen in the
+  // roster at run time). Never blank while we know where they work.
   const dept = (per.department_name && String(per.department_name).trim()) || '';
   if (dept) return dept;
-  return '';
+  const mandal = (per.work_mandal && String(per.work_mandal).trim()) || '';
+  const constituency = (per.working_constituency_name && String(per.working_constituency_name).trim()) || '';
+  if (mandal && constituency && mandal.toLowerCase() !== constituency.toLowerCase()) {
+    return mandal + ' Mandal, ' + constituency;
+  }
+  return mandal || constituency || '';
 }
 
 function designationDeptFor(per) {
@@ -577,14 +669,23 @@ async function generateOrders({ group, createdBy } = {}) {
               COALESCE(m.duty_mandal, b.mandal) AS duty_mandal,
               l.location_name AS venue,
               m.venue_code AS venue_code,
-              p.employee_name, p.designation, p.mobile_no, p.work_mandal,
-              ib.department_name
+              -- Frozen roster snapshot (migration 016) wins over live HR so
+              -- reprinting historical orders never changes after an HR edit.
+              COALESCE(rm.name, p.employee_name) AS employee_name,
+              COALESCE(rm.designation, p.designation) AS designation,
+              COALESCE(rm.mobile_no, p.mobile_no) AS mobile_no,
+              COALESCE(rm.work_mandal, p.work_mandal) AS work_mandal,
+              p.working_constituency_name AS working_constituency_name,
+              COALESCE(rm.department_name, ib.department_name) AS department_name
          FROM ${t.members} m
          JOIN ${t.batches} b ON b.id = m.batch_id
-         JOIN personnel p ON p.id = m.personnel_id
+         LEFT JOIN personnel p ON p.id = m.personnel_id
+         LEFT JOIN team_roster_members rm
+                ON rm.employee_id = m.employee_id
+               AND rm.run_id = (SELECT MAX(run_id) FROM team_roster_members)
          LEFT JOIN training_locations l ON l.id = b.location_id
          LEFT JOIN import_batches ib ON ib.id = p.import_batch_id
-        ORDER BY b.mandal, b.batch_no, p.employee_name`
+        ORDER BY b.mandal, b.batch_no, COALESCE(rm.name, p.employee_name)`
     );
 
     let sl = 0;
@@ -601,22 +702,25 @@ async function generateOrders({ group, createdBy } = {}) {
       const per = {
         department_name: row.department_name,
         designation: row.designation,
+        work_mandal: row.work_mandal,
+        working_constituency_name: row.working_constituency_name,
       };
+      // Placeholder map matches docs/{PO,APO,OPO}_Training_Order.docx exactly.
+      // .env supplies district/date/place/training time+venue+mandal; the DB
+      // (roster snapshot first) supplies the officer + Stage-3 duty details.
       const data = {
         ...defaults,
-        sl_no: String(sl),
-        employee_id: row.employee_id || '',
-        employee_name: row.employee_name || '',
-        designation_dept: designationDeptFor(per),
-        office_address: officeAddressFor(per),
-        mobile_no: row.mobile_no || '',
-        training_venue: row.venue || '',
-        duty_mandal: row.duty_mandal || '',
-        venue_code: row.venue_code || '',
-        ack_name: row.employee_name || '',
-        ack_designation: row.designation || '',
-        ack_mobile: row.mobile_no || '',
-        ack_work_mandal: row.work_mandal || '',
+        sl: String(sl),
+        officer_id: row.employee_id || '',
+        officer_name: row.employee_name || '',
+        officer_designation: designationDeptFor(per),
+        officer_working_addr: officeAddressFor(per),
+        officer_mobile: row.mobile_no || '',
+        officer_working_mandal: row.work_mandal || '',
+        // Order-level location: batch venue (training centre) or .env default.
+        training_venue: row.venue || defaults.training_venue || '',
+        // Duty mandal = Stage-3 station mandal (falls back to batch mandal).
+        training_mandal: row.duty_mandal || defaults.training_mandal || '',
       };
       let docx;
       try {
@@ -626,6 +730,27 @@ async function generateOrders({ group, createdBy } = {}) {
         continue;
       }
       const orderId = `TR-${g}-${Date.now().toString(36).toUpperCase()}-${crypto.randomInt(100000, 999999)}-${sl}`;
+      // Persist a copy on disk so orders can be printed straight off the
+      // server (generated-documents/<GROUP>/). Best-effort: DB is the source
+      // of truth; a disk failure never fails the order.
+      const safeName = String(row.employee_name || row.employee_id || 'officer')
+        .replace(/[^\w.\- ]+/g, '_')
+        .trim()
+        .replace(/\s+/g, '_')
+        .slice(0, 60) || 'officer';
+      const diskDir = path.join(__dirname, '../../../generated-documents', g);
+      try {
+        fs.mkdirSync(diskDir, { recursive: true });
+        const slp = String(sl).padStart(4, '0');
+        fs.writeFileSync(
+          path.join(diskDir, `${slp}_${safeName}_${orderId}.docx`),
+          docx
+        );
+      } catch (diskErr) {
+        if (process.env.NODE_ENV !== 'test') {
+          console.warn('[generateOrders] disk save failed:', diskErr.message);
+        }
+      }
       await client.query(
         `INSERT INTO ${t.orders}
            (order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
@@ -692,11 +817,12 @@ async function listTrainingOrders({ group, page = 1, perPage = 50 } = {}) {
     };
   }
 
-  // Both groups — single paginated UNION ALL so page > 1 actually pages through
-  // all PO + APO orders instead of re-fetching offset 0 on every page.
+  // All groups — single paginated UNION ALL so page > 1 actually pages
+  // through PO + APO + OPO instead of re-fetching offset 0 on every page.
   const countR = await pool.query(
     `SELECT (SELECT COUNT(*) FROM po_training_orders) +
-             (SELECT COUNT(*) FROM apo_training_orders) AS c`
+             (SELECT COUNT(*) FROM apo_training_orders) +
+             (SELECT COUNT(*) FROM opo_training_orders) AS c`
   );
   const total = Number(countR.rows[0].c || 0);
   const rows = await pool.query(
@@ -707,6 +833,10 @@ async function listTrainingOrders({ group, page = 1, perPage = 50 } = {}) {
      SELECT id, order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
             mandal, venue, status, created_at, 'APO' AS training_group
        FROM apo_training_orders
+     UNION ALL
+     SELECT id, order_id, sl_no, batch_id, personnel_id, employee_id, employee_name,
+            mandal, venue, status, created_at, 'OPO' AS training_group
+       FROM opo_training_orders
      ORDER BY sl_no ASC, id ASC
      LIMIT $1 OFFSET $2`,
     [per, offset]
@@ -776,6 +906,7 @@ async function buildOrdersZip(group) {
   if (g === 'ALL') {
     await addGroup('PO');
     await addGroup('APO');
+    await addGroup('OPO');
   } else {
     tablesFor(g);
     await addGroup(g);
@@ -789,7 +920,7 @@ async function buildOrdersZip(group) {
 
   const buffer = zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
   const filename =
-    g === 'ALL' ? 'training-orders-PO-APO.zip' : `training-orders-${g}.zip`;
+    g === 'ALL' ? 'training-orders-PO-APO-OPO.zip' : `training-orders-${g}.zip`;
   return { buffer, filename, count };
 }
 

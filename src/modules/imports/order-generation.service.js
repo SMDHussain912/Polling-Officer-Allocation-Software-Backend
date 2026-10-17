@@ -1,27 +1,24 @@
 'use strict';
 
 /**
- * order-generation.service.js — generate an order .docx for an appointment and
- * (optionally) email it as an attachment.
+ * order-generation.service.js — generate an order .docx for an appointment.
  *
- * Flow for generateAndSend({ assignmentId, sendEmail, actorId }):
+ * Flow for generateOrder({ assignmentId, actorId }):
  *   1. load the manual appointment + its personnel (non-sensitive columns)
  *   2. load the active template for the appointment's order_kind
  *   3. load order_config (election metadata)
  *   4. build the merge data + merge the .docx (order-merge.service)
  *   5. record metadata in generated_documents (the .docx bytes are NOT stored
  *      in the DB — scope_id points at the assignment; file on disk optional)
- *   6. if sendEmail and the personnel has an email -> send via the Gmail
- *      provider with the .docx attached (fails clearly if unconfigured)
  *
- * Nothing is invented: if there is no template, no email, or the provider is
- * unconfigured, we fail closed with a clear reason (never a fake success).
+ * Nothing is invented: if there is no template we fail closed with a clear
+ * reason (never a fake success). Delivery is out of scope — the caller
+ * downloads the .docx from the generate response.
  */
 
 const pool = require('../../database');
 const { getOrderTemplate, getOrderConfig } = require('./intake.service');
 const { mergeDocx, buildMergeData, filenameFor } = require('./order-merge.service');
-const { createGmailProvider } = require('../notifications/providers');
 
 // order_kind -> template kind. Manual appointments map 1:1 to a template kind.
 const KIND_TO_TEMPLATE = {
@@ -35,7 +32,7 @@ function loadAssignmentWithPersonnel(assignmentId) {
       `SELECT a.id, a.order_kind, a.personnel_id, a.role, a.team_no, a.table_no,
               a.body_name,
               p.employee_id, p.employee_name, p.designation, p.work_mandal,
-              p.native_mandal, p.email
+              p.native_mandal
          FROM order_assignments a
          JOIN personnel p ON p.id = a.personnel_id
         WHERE a.id = $1`,
@@ -109,11 +106,11 @@ async function generateOrderDocx(assignmentId) {
 }
 
 /**
- * generateAndSend({ assignmentId, sendEmail, actorId }):
- *   generates the .docx, records generated_documents metadata, and when
- *   sendEmail is true emails it to the officer. Returns a summary.
+ * generateOrder({ assignmentId, actorId }):
+ *   generates the .docx and records generated_documents metadata.
+ *   Returns { ok, document, fileName, bytes, docxBase64 }.
  */
-async function generateAndSend({ assignmentId, sendEmail, actorId } = {}) {
+async function generateOrder({ assignmentId, actorId } = {}) {
   const { fileName, buffer, assignment, templateKind } = await generateOrderDocx(assignmentId);
 
   const doc = await recordGeneratedDocument({
@@ -125,51 +122,18 @@ async function generateAndSend({ assignmentId, sendEmail, actorId } = {}) {
     createdBy: actorId,
   });
 
-  const result = {
+  return {
     ok: true,
     document: doc,
     fileName,
     bytes: buffer.length,
-    emailed: false,
+    // base64 so the client can download/save without a disk round-trip.
+    docxBase64: buffer.toString('base64'),
   };
-
-  if (sendEmail) {
-    if (!assignment.email) {
-      // No address on file -> we did NOT send; surface it, never fake success.
-      result.emailError = 'personnel has no email on file';
-      return result;
-    }
-    const gmail = createGmailProvider();
-    if (!gmail.isConfigured()) {
-      result.emailError = 'email provider not configured (GMAIL_* env missing)';
-      return result;
-    }
-    const subject = (assignment.role || 'Polling Duty') + ' — appointment order';
-    const message =
-      'Dear ' + (assignment.employee_name || 'Officer') + ',\n\n' +
-      'Please find attached your appointment order (' + (assignment.role || '') + ').\n';
-    const sent = await gmail.send({
-      to: assignment.email,
-      subject,
-      message,
-      attachments: [
-        {
-          filename: fileName,
-          contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          content: buffer.toString('base64'),
-        },
-      ],
-    });
-    result.emailed = true;
-    result.providerMessageId = sent.providerMessageId || null;
-    result.email = assignment.email;
-  }
-
-  return result;
 }
 
 module.exports = {
   KIND_TO_TEMPLATE,
   generateOrderDocx,
-  generateAndSend,
+  generateOrder,
 };

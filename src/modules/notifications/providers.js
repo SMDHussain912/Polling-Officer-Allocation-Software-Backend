@@ -1,8 +1,7 @@
 'use strict';
 
 /**
- * Notification provider adapters — Fast2SMS (SMS), Meta WhatsApp Cloud API,
- * and Gmail API.
+ * Notification provider adapters — Fast2SMS (SMS) and Meta WhatsApp Cloud API.
  *
  * Contract (every provider):
  *   isConfigured()            -> boolean
@@ -133,103 +132,10 @@ function createWhatsAppProvider(opts) {
   return { name: 'whatsapp', channel: 'whatsapp', isConfigured, status, send };
 }
 
-// --- Gmail API --------------------------------------------------------------
-function createGmailProvider(opts) {
-  opts = opts || {};
-  const env = opts.env || process.env;
-  const senderEmail = env.GMAIL_SENDER_EMAIL;
-  const accessToken = env.GMAIL_ACCESS_TOKEN;
-  const httpClient = opts.httpClient || defaultHttpPost;
-
-  function isConfigured() { return !!(senderEmail && accessToken); }
-  function status() {
-    const missing = [];
-    if (!senderEmail) missing.push('GMAIL_SENDER_EMAIL');
-    if (!accessToken) missing.push('GMAIL_ACCESS_TOKEN');
-    return { configured: isConfigured(), missing: missing };
-  }
-
-  async function send(input) {
-    if (!isConfigured()) {
-      throw new NotificationConfigError(
-        'Gmail is not configured (GMAIL_SENDER_EMAIL / GMAIL_ACCESS_TOKEN missing).'
-      );
-    }
-    const subject = input.subject || 'Polling Duty Assignment';
-    const attachments = Array.isArray(input.attachments) ? input.attachments : [];
-
-    let raw;
-    if (attachments.length === 0) {
-      // Simple text/plain message (unchanged behaviour).
-      raw = [
-        'From: ' + senderEmail,
-        'To: ' + input.to,
-        'Subject: ' + subject,
-        'Content-Type: text/plain; charset="UTF-8"',
-        '',
-        input.message,
-      ].join('\r\n');
-    } else {
-      // MIME multipart/mixed: one text/plain part + one part per attachment.
-      // Attachment content is expected as base64 (Buffer -> base64 string).
-      const boundary = 'poas_' + Date.now().toString(16) + '_' + Math.random().toString(16).slice(2);
-      const lines = [
-        'From: ' + senderEmail,
-        'To: ' + input.to,
-        'Subject: ' + subject,
-        'MIME-Version: 1.0',
-        'Content-Type: multipart/mixed; boundary="' + boundary + '"',
-        '',
-        '--' + boundary,
-        'Content-Type: text/plain; charset="UTF-8"',
-        'Content-Transfer-Encoding: 7bit',
-        '',
-        input.message,
-      ];
-      for (const att of attachments) {
-        const filename = att.filename || 'attachment';
-        const contentType = att.contentType || 'application/octet-stream';
-        const b64 = typeof att.content === 'string'
-          ? att.content
-          : Buffer.from(att.content || '').toString('base64');
-        lines.push(
-          '--' + boundary,
-          'Content-Type: ' + contentType + '; name="' + filename + '"',
-          'Content-Disposition: attachment; filename="' + filename + '"',
-          'Content-Transfer-Encoding: base64',
-          '',
-          b64
-        );
-      }
-      lines.push('--' + boundary + '--', '');
-      raw = lines.join('\r\n');
-    }
-
-    const encoded = Buffer.from(raw, 'utf8').toString('base64url');
-    const url = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
-    const res = await httpClient(url, {
-      method: 'POST',
-      headers: { authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ raw: encoded }),
-    });
-    if (!res.ok) {
-      const err = new Error('Gmail send failed (HTTP ' + res.status + ')');
-      err.statusCode = res.status;
-      err.transient = res.status === 429 || res.status >= 500;
-      throw err;
-    }
-    const data = res.data || {};
-    return { providerMessageId: data.id || null, provider: 'gmail' };
-  }
-
-  return { name: 'gmail', channel: 'email', isConfigured, status, send };
-}
-
 module.exports = {
   NotificationConfigError: NotificationConfigError,
   isTransient: isTransient,
   createFast2smsProvider: createFast2smsProvider,
   createWhatsAppProvider: createWhatsAppProvider,
-  createGmailProvider: createGmailProvider,
 };
 

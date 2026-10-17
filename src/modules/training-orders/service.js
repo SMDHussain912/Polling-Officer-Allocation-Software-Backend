@@ -47,12 +47,12 @@ async function wipeAllData(req, res) {
   }
 }
 
-/** POST /training-orders/generate  body: { group: 'PO'|'APO' } */
+/** POST /training-orders/generate  body: { group: 'PO'|'APO'|'OPO' } */
 async function generate(req, res) {
   try {
     const group = req.body && req.body.group;
-    if (!group || !['PO', 'APO'].includes(String(group).toUpperCase())) {
-      return res.status(400).json({ ok: false, error: 'group (PO|APO) is required' });
+    if (!group || !['PO', 'APO', 'OPO'].includes(String(group).toUpperCase())) {
+      return res.status(400).json({ ok: false, error: 'group (PO|APO|OPO) is required' });
     }
     const result = await generateOrders({
       group: String(group).toUpperCase(),
@@ -82,7 +82,7 @@ async function list(req, res) {
 async function batches(req, res) {
   try {
     const group = req.query.group;
-    if (!group) return res.status(400).json({ ok: false, error: 'group (PO|APO) is required' });
+    if (!group) return res.status(400).json({ ok: false, error: 'group (PO|APO|OPO) is required' });
     const result = await listBatches(group);
     res.json({ ok: true, ...result });
   } catch (err) {

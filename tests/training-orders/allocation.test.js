@@ -19,10 +19,15 @@ const {
   buildOrdersZip,
 } = require('../../src/modules/training-orders/index');
 
-test('classifyRole: PO / APO / MO', () => {
+test('classifyRole: PO / APO (4th slot) / OPO / MO', () => {
   assert.equal(classifyRole('Presiding Officer'), 'PO');
-  assert.equal(classifyRole('Polling Officer 1'), 'APO');
-  assert.equal(classifyRole('Polling Officer 5'), 'APO');
+  assert.equal(classifyRole('4th Polling Officer'), 'APO');   // single Assistant PO
+  assert.equal(classifyRole('1st Polling Officer'), 'OPO');
+  assert.equal(classifyRole('2nd Polling Officer'), 'OPO');
+  assert.equal(classifyRole('3rd Polling Officer'), 'OPO');
+  assert.equal(classifyRole('5th Polling Officer'), 'OPO');
+  assert.equal(classifyRole('Polling Officer 1'), 'OPO');
+  assert.equal(classifyRole('Polling Officer 5'), 'OPO');
   assert.equal(classifyRole('Micro Observer'), 'MO');
   assert.equal(classifyRole('micro observer (bank)'), 'MO');
 });
@@ -35,40 +40,36 @@ test('parseTrainingDate supports dd.mm.yyyy', () => {
   assert.ok(p.weekday);
 });
 
-test('built-in tagged PO template merges officer + training FROM-TO fields', () => {
-  const templatePath = path.join(__dirname, '../../docs/po-order-tagged.docx');
-  assert.ok(fs.existsSync(templatePath), 'po-order-tagged.docx must exist');
+test('built-in tagged PO template merges officer + training fields', () => {
+  // Template renamed to PO_Training_Order.docx; tags are single-brace and
+  // officer-scoped (officer_working_addr = Working Office Address line).
+  const templatePath = path.join(__dirname, '../../docs/PO_Training_Order.docx');
+  assert.ok(fs.existsSync(templatePath), 'PO_Training_Order.docx must exist');
   const out = orderMerge.mergeDocx(fs.readFileSync(templatePath), {
-    sl_no: '7',
+    sl: '7',
     district: 'Kakinada',
-    employee_id: 'EMP9',
-    employee_name: 'Rama Rao',
-    designation_dept: 'Clerk / Revenue',
-    office_address: 'Revenue Department',
-    mobile_no: '9000000000',
-    order_date: '15.10.2026',
-    order_place: 'Kakinada',
-    election_year: '2026',
-    training_dd: '20',
-    training_mm: '10',
-    training_weekday: 'Tuesday',
-    training_time_from: '10:00 AM',
-    training_time_to: '01:00 PM',
+    officer_id: 'EMP9',
+    officer_name: 'Rama Rao',
+    officer_designation: 'Clerk / Revenue',
+    officer_working_addr: 'Kakinada Mandal, Kakinada City',
+    officer_working_mandal: 'Kakinada',
+    officer_mobile: '9000000000',
+    date: '15.10.2026',
+    place: 'Kakinada',
+    training_day: '20',
+    training_month: '10',
+    training_time_H: '10',
+    training_time_min: '00',
     training_venue: 'ZPHS Samalkot',
-    duty_mandal: 'Samalkot',
-    ack_name: 'Rama Rao',
-    ack_designation: 'Clerk',
-    ack_mobile: '9000000000',
-    ack_work_mandal: 'Kakinada Rural',
+    training_mandal: 'Samalkot',
   });
   const xml = new PizZip(out).file('word/document.xml').asText();
-  assert.ok(xml.includes('Rama Rao'));
-  assert.ok(xml.includes('10:00 AM'));
-  assert.ok(xml.includes('01:00 PM'));
-  assert.ok(xml.includes('Samalkot'));
-  assert.ok(xml.includes('Kakinada Rural'));
-  assert.ok(!xml.includes('{employee_name}'));
-  assert.ok(!xml.includes('{{employee_name}}'));
+  assert.ok(xml.includes('Rama Rao'), 'officer name merged');
+  assert.ok(xml.includes('9000000000'), 'mobile merged');
+  assert.ok(xml.includes('Samalkot'), 'duty mandal merged');
+  assert.ok(xml.includes('Kakinada Mandal, Kakinada City'), 'working office address merged');
+  assert.ok(!xml.includes('{officer_name}'), 'no unfilled single-brace tag left');
+  assert.ok(!xml.includes('{{officer_name}}'), 'no unfilled double-brace tag left');
 });
 
 test('allocateTraining wipes + splits PO/APO per mandal; skips MO (stubbed pool)', async () => {
@@ -81,8 +82,8 @@ test('allocateTraining wipes + splits PO/APO per mandal; skips MO (stubbed pool)
     if (/INSERT INTO allocation_runs/i.test(String(sql))) {
       return { rows: [{ id: 999, run_at: new Date() }] };
     }
-    // cold-start hydrate / stage-table read both return empty -> run JSON path
-    if (/FROM allocation_runs|FROM stage2_team_members/i.test(String(sql))) {
+    // cold-start hydrate / roster read both return empty -> run JSON path
+    if (/FROM allocation_runs|FROM team_roster_members/i.test(String(sql))) {
       return { rows: [] };
     }
     throw new Error('unexpected pool.query in test: ' + String(sql).slice(0, 100));
@@ -117,15 +118,15 @@ test('allocateTraining wipes + splits PO/APO per mandal; skips MO (stubbed pool)
     query: async (sql, params) => {
       const s = String(sql);
       if (/BEGIN|COMMIT|ROLLBACK/i.test(s)) return { rows: [] };
-      if (/DELETE FROM (po|apo)_training/i.test(s)) return { rows: [] };
+      if (/DELETE FROM (po|apo|opo)_training/i.test(s)) return { rows: [] };
       if (/FROM personnel p/i.test(s) && /employee_id = ANY/i.test(s)) {
         const ids = params[0] || [];
         return { rows: ids.map((id) => personnelByEmp[id]).filter(Boolean) };
       }
-      if (/INSERT INTO (po|apo)_training_batches/i.test(s)) {
+      if (/INSERT INTO (po|apo|opo)_training_batches/i.test(s)) {
         return { rows: [{ id: seq++ }] };
       }
-      if (/INSERT INTO (po|apo)_training_batch_members/i.test(s)) {
+      if (/INSERT INTO (po|apo|opo)_training_batch_members/i.test(s)) {
         return { rows: [] };
       }
       throw new Error('unexpected SQL in test: ' + s.slice(0, 120));
@@ -139,7 +140,8 @@ test('allocateTraining wipes + splits PO/APO per mandal; skips MO (stubbed pool)
     assert.equal(result.skippedMo, 1);
     assert.equal(result.batches.length, 3);
     const groups = result.batches.map((b) => b.group + '/' + b.mandal).sort();
-    assert.deepEqual(groups, ['APO/M1', 'PO/M1', 'PO/M2']);
+    // Polling Officer 1/2 now classify as OPO (Other Presiding Officers).
+    assert.deepEqual(groups, ['OPO/M1', 'PO/M1', 'PO/M2']);
   } finally {
     pool.connect = realConnect;
     pool.query = realQuery;
@@ -147,19 +149,19 @@ test('allocateTraining wipes + splits PO/APO per mandal; skips MO (stubbed pool)
   }
 });
 
-test('allocateTraining prefers stage tables (014) over run JSON', async () => {
+test('allocateTraining prefers frozen team roster over run JSON', async () => {
   const pool = require('../../src/database');
   // latestStageTables reads via pool.query — stub a stored run with a
   // pre-classified PO + APO row (MO already excluded at persist time).
   const realQuery = pool.query;
   const stageRows = [
-    { run_id: 7, team_code: 'T1', employee_id: 'E201', personnel_id: 11, role: 'Presiding Officer', duty: null, training_group: 'PO', mandal: 'M9', station_id: null, station_code: null, station_mandal: null, publication_status: 'confidential' },
-    { run_id: 7, team_code: 'T1', employee_id: 'E202', personnel_id: 12, role: 'Polling Officer 1', duty: null, training_group: 'APO', mandal: 'M9', station_id: null, station_code: null, station_mandal: null, publication_status: 'confidential' },
+    { run_id: 7, team_code: 'T1', employee_id: 'E201', personnel_id: 11, role: 'Presiding Officer', duty: null, training_group: 'PO', name: 'PO9', designation: 'D', department_name: 'Dept', mobile_no: null, work_mandal: 'W', native_mandal: 'N', mandal: 'M9', duty_mandal: null, venue_code: null, station_id: null, station_code: null, station_mandal: null, publication_status: 'confidential' },
+    { run_id: 7, team_code: 'T1', employee_id: 'E202', personnel_id: 12, role: 'Polling Officer 1', duty: null, training_group: 'APO', name: 'APO9', designation: 'D', department_name: 'Dept', mobile_no: null, work_mandal: 'W', native_mandal: 'N', mandal: 'M9', duty_mandal: null, venue_code: null, station_id: null, station_code: null, station_mandal: null, publication_status: 'confidential' },
   ];
   pool.query = async (sql) => {
     const s = String(sql);
-    if (/FROM stage2_team_members/i.test(s)) return { rows: stageRows };
-    // cold-start hydrate returns no prior run -> falls to stage tables
+    if (/FROM team_roster_members/i.test(s)) return { rows: stageRows };
+    // cold-start hydrate returns no prior run -> falls to the roster
     if (/FROM allocation_runs/i.test(s)) return { rows: [] };
     throw new Error('unexpected pool.query in test: ' + s.slice(0, 100));
   };
@@ -174,13 +176,13 @@ test('allocateTraining prefers stage tables (014) over run JSON', async () => {
     query: async (sql, params) => {
       const s = String(sql);
       if (/BEGIN|COMMIT|ROLLBACK/i.test(s)) return { rows: [] };
-      if (/DELETE FROM (po|apo)_training/i.test(s)) return { rows: [] };
+      if (/DELETE FROM (po|apo|opo)_training/i.test(s)) return { rows: [] };
       if (/FROM personnel p/i.test(s) && /employee_id = ANY/i.test(s)) {
         const ids = params[0] || [];
         return { rows: ids.map((id) => personnelByEmp[id]).filter(Boolean) };
       }
-      if (/INSERT INTO (po|apo)_training_batches/i.test(s)) return { rows: [{ id: seq++ }] };
-      if (/INSERT INTO (po|apo)_training_batch_members/i.test(s)) return { rows: [] };
+      if (/INSERT INTO (po|apo|opo)_training_batches/i.test(s)) return { rows: [{ id: seq++ }] };
+      if (/INSERT INTO (po|apo|opo)_training_batch_members/i.test(s)) return { rows: [] };
       throw new Error('unexpected SQL in test: ' + s.slice(0, 120));
     },
     release: async () => {},

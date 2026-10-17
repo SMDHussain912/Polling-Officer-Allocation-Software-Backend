@@ -30,8 +30,8 @@ const {
   buildOrdersZip,
 } = require('../../src/modules/training-orders/index');
 
-const PO_TEMPLATE = path.join(__dirname, '../../docs/po-order-tagged.docx');
-const APO_TEMPLATE = path.join(__dirname, '../../docs/apo-order-tagged.docx');
+const PO_TEMPLATE = path.join(__dirname, '../../docs/PO_Training_Order.docx');
+const APO_TEMPLATE = path.join(__dirname, '../../docs/APO_Training_Order.docx');
 
 function isDocx(buf) {
   return (
@@ -97,10 +97,13 @@ async function seedGroup(client, group, mandal, n) {
 async function cleanupAll(client) {
   await client.query('DELETE FROM po_training_orders');
   await client.query('DELETE FROM apo_training_orders');
+  await client.query('DELETE FROM opo_training_orders');
   await client.query('DELETE FROM po_training_batch_members');
   await client.query('DELETE FROM apo_training_batch_members');
+  await client.query('DELETE FROM opo_training_batch_members');
   await client.query('DELETE FROM po_training_batches');
   await client.query('DELETE FROM apo_training_batches');
+  await client.query('DELETE FROM opo_training_batches');
 }
 test('generateOrders stores valid order_docx for PO and APO (real template, real DB)', async (t) => {
   const client = await pool.connect();
@@ -254,12 +257,12 @@ test('buildOrdersZip returns valid ZIP with all stored orders', async (t) => {
 });
 
 test('built-in templates are real .docx files', () => {
-  assert.ok(fs.existsSync(PO_TEMPLATE), 'po-order-tagged.docx must exist');
-  assert.ok(fs.existsSync(APO_TEMPLATE), 'apo-order-tagged.docx must exist');
+  assert.ok(fs.existsSync(PO_TEMPLATE), 'PO_Training_Order.docx must exist');
+  assert.ok(fs.existsSync(APO_TEMPLATE), 'APO_Training_Order.docx must exist');
   const poBytes = fs.readFileSync(PO_TEMPLATE);
   const apoBytes = fs.readFileSync(APO_TEMPLATE);
-  assert.ok(isDocx(poBytes), 'po-order-tagged.docx must be a valid DOCX');
-  assert.ok(isDocx(apoBytes), 'apo-order-tagged.docx must be a valid DOCX');
+  assert.ok(isDocx(poBytes), 'PO_Training_Order.docx must be a valid DOCX');
+  assert.ok(isDocx(apoBytes), 'APO_Training_Order.docx must be a valid DOCX');
   assert.ok(poBytes.length > 1000, 'PO template should be non-trivial');
   assert.ok(apoBytes.length > 1000, 'APO template should be non-trivial');
 });

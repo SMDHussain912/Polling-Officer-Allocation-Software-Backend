@@ -50,10 +50,6 @@ const HEADER_MAP = {
   'previous worked as po/ apo/ opo': 'previous_po_duty',
   'mobile no.': 'mobile_no',
   'mobile no': 'mobile_no',
-  'email': 'email',
-  'email id': 'email',
-  'e-mail': 'email',
-  'email address': 'email',
   'total service in present district from last 4 years ( in all cadres)': 'service_in_district_4y',
   'whether he/she belongs ph category (ph-%)': 'ph_category',
   'whether any criminal cases pending? or if there are any orders from eci/ ceo against the person that not participate in election':

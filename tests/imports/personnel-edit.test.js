@@ -85,10 +85,10 @@ test('service: writes only allow-listed fields; ignores identity/sensitive', asy
   const res = await editPersonnel({
     id: 5,
     fields: {
-      email: 'asha@example.gov',
       mobile_no: '9876543210',
       designation: 'Senior Assistant',
-      // must be IGNORED (not in allow-list):
+      // must be IGNORED (not in allow-list; email column removed with the mail system):
+      email: 'asha@example.gov',
       employee_id: 'HACKED',
       employee_name: 'HACKED',
       aadhar_number: '9999',
@@ -100,10 +100,10 @@ test('service: writes only allow-listed fields; ignores identity/sensitive', asy
   });
   assert.equal(res.ok, true);
   assert.equal(res.id, 5);
-  assert.deepEqual(res.updated.sort(), ['designation', 'email', 'mobile_no']);
+  assert.deepEqual(res.updated.sort(), ['designation', 'mobile_no']);
   // the UPDATE SQL only references allow-listed columns
   assert.ok(lastUpdate);
-  assert.ok(lastUpdate.sql.includes("email = $"));
+  assert.ok(!/email =/i.test(lastUpdate.sql), 'email column removed with the mail system');
   assert.ok(lastUpdate.sql.includes("mobile_no = $"));
   assert.ok(lastUpdate.sql.includes("designation = $"));
   assert.ok(!/employee_id =/i.test(lastUpdate.sql));
@@ -115,20 +115,20 @@ test('service: writes only allow-listed fields; ignores identity/sensitive', asy
   assert.equal(lastUpdate.params[lastUpdate.params.length - 1], 5);
 });
 
-test('service: invalid email -> 400', async () => {
+test('service: email is no longer editable (allow-list stripped with mail system)', async () => {
   reset();
-  await assert.rejects(
-    () => editPersonnel({ id: 5, fields: { email: 'not-an-email' } }),
-    (e) => e.statusCode === 400 && /email/.test(e.message)
-  );
+  const res = await editPersonnel({ id: 5, fields: { email: 'not-an-email' } });
+  // Unknown/removed keys are ignored — never a validation error, never written.
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.updated, []);
 });
 
-test('service: valid email accepted; null clears a field', async () => {
+test('service: null clears a field', async () => {
   reset();
-  const res = await editPersonnel({ id: 5, fields: { email: 'a.b@c.gov', remarks: null } });
-  assert.deepEqual(res.updated.sort(), ['email', 'remarks']);
-  // remarks null is param index 2
-  assert.equal(lastUpdate.params[1], null);
+  const res = await editPersonnel({ id: 5, fields: { remarks: null } });
+  assert.deepEqual(res.updated, ['remarks']);
+  // remarks null is param index 1
+  assert.equal(lastUpdate.params[0], null);
 });
 
 test('service: 404 when personnel missing', async () => {
@@ -171,14 +171,16 @@ test('route: PATCH /personnel/:id authority -> 200 with updated list', async () 
   const { status, body } = await request(buildApp(AUTHORITY), 'PATCH', '/api/imports/personnel/5', { email: 'a@b.co', designation: 'SA' });
   assert.equal(status, 200);
   assert.equal(body.ok, true);
-  assert.deepEqual(body.updated.sort(), ['designation', 'email']);
+  // email was stripped from the allow-list with the mail system — ignored, not written
+  assert.deepEqual(body.updated.sort(), ['designation']);
 });
 
-test('route: PATCH invalid email -> 400', async () => {
+test('route: PATCH removed email field -> 200 ignored (mail system removed)', async () => {
   reset();
   const { status, body } = await request(buildApp(AUTHORITY), 'PATCH', '/api/imports/personnel/5', { email: 'bad' });
-  assert.equal(status, 400);
-  assert.equal(body.ok, false);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.deepEqual(body.updated, []);
 });
 
 test.after(() => {

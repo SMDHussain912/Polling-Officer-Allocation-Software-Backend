@@ -24,7 +24,6 @@ const BACKEND = path.resolve(__dirname, '..', '..');
 const {
   createFast2smsProvider,
   createWhatsAppProvider,
-  createGmailProvider,
 } = require('../../src/modules/notifications/providers');
 
 test('1. .env loads regardless of the current working directory', () => {
@@ -60,12 +59,10 @@ test('2. WhatsApp credentials come only from env', () => {
   );
 });
 
-test('2. Gmail credentials come only from env', () => {
-  assert.equal(createGmailProvider({ env: {} }).isConfigured(), false);
-  assert.equal(
-    createGmailProvider({ env: { GMAIL_SENDER_EMAIL: 'a@b.c', GMAIL_ACCESS_TOKEN: 'tok' } }).isConfigured(),
-    true
-  );
+test('2. Gmail provider was removed with the mail channel', () => {
+  const providers = require('../../src/modules/notifications/providers');
+  assert.equal(providers.createGmailProvider, undefined,
+    'mail channel removed: createGmailProvider must no longer exist');
 });
 
 test('3. missing configuration -> safe, actionable NotificationConfigError', async () => {
@@ -100,7 +97,7 @@ test('5. providers.js has no hardcoded credential literals', () => {
   // Credentials must be sourced from env, never assigned a literal value.
   assert.ok(/apiKey\s*=\s*env\.FAST2SMS_API_KEY/.test(src), 'Fast2SMS key must come from env');
   assert.ok(/token\s*=\s*env\.WHATSAPP_ACCESS_TOKEN/.test(src), 'WhatsApp token must come from env');
-  assert.ok(/accessToken\s*=\s*env\.GMAIL_ACCESS_TOKEN/.test(src), 'Gmail token must come from env');
+  assert.ok(!/GMAIL|gmail/i.test(src), 'mail provider must be fully removed');
   // No long opaque literals assigned to credential-ish variables.
   assert.ok(
     !/(apiKey|token|accessToken|secret)\s*=\s*["'][A-Za-z0-9_\-]{20,}["']/.test(src),
