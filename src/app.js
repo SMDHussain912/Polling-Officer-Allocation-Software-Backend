@@ -1,4 +1,5 @@
 const express = require('express');
+const app = express();
 const session = require('express-session');
 const morgan = require('morgan');
 const config = require('./config');
@@ -11,6 +12,10 @@ const notificationRoutes = require('./modules/notifications');
 const reportsRoutes = require('./modules/reports');
 const trainingRoutes = require('./modules/training');
 
+
+// Increased body limit to support large Excel uploads (10k+ personnel rows can be several MB)
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const app = express();
 
 // HTTP request logger (dev: combined-style output; production: same)
@@ -30,10 +35,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// 20mb limit matches the imports router's own intent: uploads are base64-JSON
-// (~1.37x file size). The app-level default (100kb) would 413 any workbook
-// over ~75KB before the route-level parser ever runs.
-app.use(express.json({ limit: '20mb' }));
 app.use(
   session({
     secret: config.sessionSecret,

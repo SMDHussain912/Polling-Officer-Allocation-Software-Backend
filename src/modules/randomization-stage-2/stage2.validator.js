@@ -75,6 +75,9 @@ function validateEmployee(raw, index) {
   if (typeof raw.nativeMandal !== 'string' || raw.nativeMandal.trim() === '') {
     throw new Stage2ValidationError(where + '.nativeMandal is required (posting-ban rule).', { field: where + '.nativeMandal' });
   }
+  if (typeof raw.gazettedStatus !== 'string' || raw.gazettedStatus.trim() === '') {
+    throw new Stage2ValidationError(where + '.gazettedStatus is required (Gazetted / Non-Gazetted).', { field: where + '.gazettedStatus' });
+  }
   if (typeof raw.seniorityRank !== 'number' || !Number.isSafeInteger(raw.seniorityRank)) {
     throw new Stage2UnresolvedRuleError(
       where + '.seniorityRank is required: explicit integer rank (lower = more senior) from the agreed mapping. Never inferred from pay or designation.',
@@ -104,6 +107,7 @@ function validateEmployee(raw, index) {
     officeName: (typeof raw.officeName === 'string' && raw.officeName.trim() !== '') ? raw.officeName.trim() : String(raw.officeId).trim(),
     workMandal: raw.workMandal,
     nativeMandal: raw.nativeMandal,
+    gazettedStatus: raw.gazettedStatus.trim(),
     seniorityRank: raw.seniorityRank,
     presidingEligible: raw.presidingEligible,
     classification: classification,

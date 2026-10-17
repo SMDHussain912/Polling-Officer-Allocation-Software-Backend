@@ -63,6 +63,9 @@ function toCandidate(p) {
     isActive: p.is_active === true,
     districtId: p.district,
     mandalId: p.work_mandal,
+    workMandal: p.work_mandal,
+    nativeMandal: p.native_mandal,
+    gazettedStatus: p.gazetted_status || null,
     exemptCategory: p.exempt_category || null,
   };
 }
@@ -111,7 +114,7 @@ function createAppStage1Repository() {
       // Eligibility rules are applied by the service (defense in depth).
       const { rows } = await pool.query(
         'SELECT employee_id, employee_name, designation, is_active, district, ' +
-          'work_mandal, native_mandal, exempt_category ' +
+          'work_mandal, native_mandal, gazetted_status, exempt_category ' +
           'FROM personnel WHERE district = $1 AND work_mandal = $2 ' +
           'AND import_batch_id = (SELECT max(id) FROM import_batches WHERE kind = $3) ' +
           'LIMIT 5000',

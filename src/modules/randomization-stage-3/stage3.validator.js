@@ -130,6 +130,14 @@ function validateOptions(raw) {
     mode = raw.mappingMode;
   }
   options.mappingMode = mode;
+  // maxAttempts: number of random bijection retries for the duty-mandala constraint.
+  options.maxAttempts = 50;
+  if (raw.maxAttempts !== undefined && raw.maxAttempts !== null) {
+    if (typeof raw.maxAttempts !== 'number' || !Number.isSafeInteger(raw.maxAttempts) || raw.maxAttempts < 1) {
+      throw new Stage3ValidationError('options.maxAttempts must be a positive integer.');
+    }
+    options.maxAttempts = raw.maxAttempts;
+  }
   // Near-mandal adjacency (migration 019): [{ mandal_name, near_mandal_names[] }].
   // When supplied and non-empty, Stage 3 maps each team only to stations in
   // mandals adjacent to every member's work/native mandal. Members arrive via
